@@ -1,0 +1,27 @@
+项目：/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-l2-pGUutL
+
+=== 安装桥 ===
+✔ installBridge 成功 — copied=2
+✔ project.godot 启用插件
+
+=== 启动 headless 编辑器 ===
+✔ 编辑器会话已启动 — editor-4d359259
+✔ 编辑器桥监听 9089 — listening
+
+=== 通过本项目 Node 客户端调用 L2 ===
+✔ editor.info — project=/private/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-l2-pGUutL/
+✔ editor.scene_tree 能看到 Sprite 节点 — len=220
+✔ editor.add_node 新增 Camera2D — {"node_name":"McpCam","node_path":"McpCam","parent_path":".","properties":[],"type":"Camera2D","undoable":true}
+✔ 新增节点出现在场景树里 — found
+✔ editor.set_property 写 Vector2 — {"node_path":"Sprite","previous":{"x":0,"y":0},"property":"position","undoable":true,"value":{"x":12,"y":34}}
+✔ editor.execute 逃生舱 — {"finished":true,"mcp_result":{"engine":"4.7.2-stable (official)","nodes":22002},"result":{"engine":"4.7.2-stable (official)","nodes":22002},"returned":true,"timed_out":false,"wrapped":true}
+✔ editor.save_scene — {"saved":true,"scene_path":"res://main.tscn"}
+
+=== 错误路径 ===
+✔ 未知 op 返回 ok:false — unknown op: 'editor.no_such_op'
+
+=== 收尾 ===
+✔ 编辑器会话已停止 — {"id":"editor-4d359259","stopped":true,"forced":false,"exitCode":null,"signal":"SIGTERM"}
+
+=== 汇总 ===
+通过 13/13

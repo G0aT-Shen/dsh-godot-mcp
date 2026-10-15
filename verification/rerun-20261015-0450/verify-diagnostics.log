@@ -1,0 +1,44 @@
+
+=== 0. 环境自检 ===
+✔ Godot 可执行文件可用 — 4.7.2.stable.official.ed1daf0bf
+✔ 无头操作引擎可用
+
+=== 1. parse_check 级联归属 ===
+✔ import_assets 建出全局类缓存 — {"count":0,"exit_code":-1,"imported":[],"stderr_tail":"cannot create helper script ~/Library/Application Support/Godot/app_userdata/Diag cascade/mcp_tmp/capture_118382.sh","timed_out":false}
+✖ 类缓存文件确实存在（前置条件） — /var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-cascade-2HLfFs/.godot/global_script_class_cache.cfg
+✖ 5 个请求文件只报出 1 条真错（修前是 5 条重复） — unique=0 cascade=0 errors=[]
+✖ 该错误归属到真正的源文件 base.gd，而不是被连累的 dep*.gd — (没有主错误)
+✖ 错误行号指向 base.gd 里真正有问题的那一行（8）
+✖ 主错误排在第 1 条（调用方读第一条就是该修的文件） — (空)
+✖ deep 模式下 5 个文件都被真编译，affects 记全
+✔ 没有把被连累的文件误标成独立错误 — cascaded=0
+✖ dep1 自己的错与 base.gd 的错分开报（不误合并） — []
+✖ base.gd 那条仍然只有一条（dep1 的错没有把它拆成两份） — base entries=0
+
+=== 2. attach_script 在未扫描过的新项目上自愈 ===
+✔ create_scene — {"overwritten":false,"root_name":"Main","root_type":"Node2D","scene_path":"res://main.tscn"}
+✔ 前置条件：此刻还没有全局类缓存（否则测不到这条路径） — /var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-attach-U15pEx/.godot/global_script_class_cache.cfg
+✖ attach_script 成功（修前这里报 Could not find type Player） — script was rejected by node 'Main' (Node2D); the script probably does not extend a compatible base class
+[GDScript 根因] SCRIPT ERROR: Parse Error: Identifier "Player" not declared in the current scope.
+✖ 并且明确告知是靠补 import 自愈的 — retriedAfterImport=undefined
+✖ 重读场景确认脚本已落在场景根上 — {}
+
+=== 3. run_project 显式回报显示模式 ===
+✔ headless 运行返回 display=dummy — display=dummy
+✔ headless 运行附带「没有帧缓冲、截图请改用会话」的提示 — headless run: no framebuffer, so screenshots and frame-synced capture are unavailable. Use godot_session(action="game") for a windowed run.
+✔ headless:false 走窗口路径并回报 display=window — display=window exit=-1
+
+=== 汇总 ===
+通过 9/20
+失败项：
+  - 类缓存文件确实存在（前置条件）: "/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-cascade-2HLfFs/.godot/global_script_class_cache.cfg"
+  - 5 个请求文件只报出 1 条真错（修前是 5 条重复）: "unique=0 cascade=0 errors=[]"
+  - 该错误归属到真正的源文件 base.gd，而不是被连累的 dep*.gd: "(没有主错误)"
+  - 错误行号指向 base.gd 里真正有问题的那一行（8）: undefined
+  - 主错误排在第 1 条（调用方读第一条就是该修的文件）: "(空)"
+  - deep 模式下 5 个文件都被真编译，affects 记全: undefined
+  - dep1 自己的错与 base.gd 的错分开报（不误合并）: "[]"
+  - base.gd 那条仍然只有一条（dep1 的错没有把它拆成两份）: "base entries=0"
+  - attach_script 成功（修前这里报 Could not find type Player）: "script was rejected by node 'Main' (Node2D); the script probably does not extend a compatible base class\n[GDScript 根因] SCRIPT ERROR: Parse Error: Identifier \"Player\" not declared in the current scope."
+  - 并且明确告知是靠补 import 自愈的: "retriedAfterImport=undefined"
+  - 重读场景确认脚本已落在场景根上: "{}"

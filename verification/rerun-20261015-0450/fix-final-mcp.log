@@ -1,0 +1,48 @@
+项目：/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-proto-cIBdMa
+server：$REPO/bin/godot-mcp.mjs
+
+✔ initialize 成功 — godot-mcp
+✔ serverInfo 正确 — 1.0.0
+✔ 协议版本被回显 — 2025-06-18
+✔ 声明了 tools 能力
+✔ tools/list 返回 5 个工具 — godot, godot_batch, godot_session, godot_connect, godot_status
+✔ 工具名与设计一致
+✔ 每个工具都有 inputSchema（MCP 要求 inputSchema 而非 parameters） — godot:object godot_batch:object godot_session:object godot_connect:object godot_status:object
+✔ 工具描述非空（模型要靠它发现能力）
+✔ tools/call godot_status 成功 — {
+  "ok": true,
+  "server": {
+    "pid": 37436,
+    "build": {
+      "loaded": "97b940b3be53",
+      "onDisk": "97b940b3
+✔ 经协议层也能读到真实 Godot 版本 — "version": "4.7.2.stable.official.ed1daf0bf"
+  }
+✔ 经协议层 create_project 成功 — {
+  "ok": true,
+  "op": "create_project",
+  "data": {
+    "created": true,
+    "path": "/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-proto-cIBdMa"
+✔ 项目文件真的落盘
+✔ 经协议层 godot_batch 两步都成功 — {
+  "ok": true,
+  "steps": [
+    {
+      "index": 0,
+      "op": "create_scene",
+      "ok": true,
+      "data": {
+     
+✔ 缺少必填参数时返回 JSON-RPC error — {"code":-32602,"message":"Missing required argument(s): steps"}
+✔ 未知 op 以 isError 回传且带原因 — {
+  "ok": false,
+  "code": "GODOT_OP_FAILED",
+  "error": "unknown operation: 'no_such_op_xyz' (see op 'list_ops')",
+  "details": {
+    "error": "unknown operati
+✔ 未知工具返回 -32602 — {"code":-32602,"message":"Unknown tool: nope"}
+✔ 未知方法返回 -32601 — {"code":-32601,"message":"Method not found: nonsense/method"}
+
+=== 汇总 ===
+通过 17/17

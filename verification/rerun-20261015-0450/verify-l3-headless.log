@@ -1,0 +1,97 @@
+项目：/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-l3-DnPoKo
+模式：headless
+
+=== 安装桥 ===
+✔ installBridge 成功 — copied=2
+✔ autoload 已写入
+
+=== 启动游戏 ===
+✔ 游戏会话已启动 — game-6f1d4756
+✔ 运行时桥监听 9091 — listening
+
+=== 通过本项目 Node TCP 客户端调用 L3 ===
+✔ rt.info — {"auto_resumes":0,"clients":1,"display_driver":"headless","error_count":0,"error_recorder":true,"fps":1,"frame":37,"freeze_mode":"none","frozen":false,"gate":"open: editor","godot_version":"4.7.2-stab
+✔ rt.scene_tree 能看到 Main/Hud — found
+✔ rt.call_method bump(7) 返回 7 — {"arg_count":1,"method":"bump","node_path":"/root/Main","result":7}
+✔ rt.get_property counter 被副作用改成 7 — {"node_path":"/root/Main","property":"counter","type":"int","value":7}
+✔ rt.set_property counter=42 — {"changed":true,"node_path":"/root/Main","previous":7,"property":"counter","value":42}
+✔ rt.get_property 读回 42 — {"node_path":"/root/Main","property":"counter","type":"int","value":42}
+✔ rt.input 注入按键 — {"injected":"key_tap","key":"SPACE","keycode":32}
+✔ 注入的按键在游戏内可观测（last_key=Space） — {"node_path":"/root/Main","property":"last_key","type":"String","value":"Space"}
+✔ rt.eval 逃生舱返回 42 — {"finished":true,"mcp_result":42,"result":42,"returned":true,"timed_out":false,"wrapped":true}
+
+=== 截图 ===
+✔ rt.screenshot 在 headless 下如实报错（预期行为） — rt.screenshot needs a real display driver; the headless dummy renderer has no framebuffer (run the game without --headless)
+
+=== 错误路径 ===
+✔ 读不存在的属性返回 ok:false — node 'Main' (Node2D) has no property 'no_such_property_xyz'
+
+=== 确定性时间控制 ===
+✔ rt.freeze 硬冻结（time_scale=0 且 paused=true） — time_scale=0 paused=true
+✔ 冻结期间 _process 完全停止（帧计数不增长） — frames 136 → 136（真实等待 700ms）
+✔ rt.step{frames:30} 精确推进 30 帧且游戏确实前进了 — frames=30 ms=207.77 x 107.8→127.9
+✔ rt.step{until} 条件达成即停（不是跑满预算） — satisfied=true frames=106
+✔ 条件永不成立时如实回 satisfied=false 且耗尽预算（不假装成功） — satisfied=false frames=12
+✔ 超出步进上限被明确拒绝 — step 超出上限（frames<=1800, ms<=30000）；要推进更长的时间请分多次调用
+✔ rt.resume 把 time_scale 与 paused 都还原 — {"auto_resumes":0,"frame":394,"frozen":false,"paused":false,"time_scale":1}
+
+=== 结构化状态 digest ===
+✔ rt.digest 按 group 选中节点并带出结构化字段 — {"class":"Marker2D","global_position":{"x":207.968109130859,"y":0},"modulate":{"a":1,"b":1,"g":1,"r":1},"name":"Runner","path":"/root/Main/Runner","po
+✔ rt.digest 支持按 class 选节点和追加自定义属性 — {"class":"Label","global_position":{"x":0,"y":0},"modulate":{"a":1,"b":1,"g":1,"r":1},"name":"Hud","path":"/root/Main/Hud","position":{"x":0,"y":0},"r
+✔ 不存在的 group 如实回报 missing_groups（不静默返回空） — ["no_such_group_xyz"]
+
+=== 控件清单 rt.ui ===
+✔ rt.ui 列出可见 Control（含矩形与文本） — count=2 btn={"text":"Start","rect":{"h":31,"w":46,"x":8,"y":8}}
+✔ rt.ui 带出 mouse_filter / disabled 这类交互属性 — mouse_filter=0 disabled=false
+
+=== 输入序列 rt.act ===
+✔ rt.act 执行完整序列 — executed=3/3 frames=5
+✔ 每一步回报「点到了哪个 Control」 — /root/Main/StartBtn [Button] "Start"
+✔ 注入的点击真的触发了按钮（clicks 增加） — clicks 0 → 1
+✔ 每一步回报「这一步之后被观察节点的状态」 — initial.clicks=0 step0.after.clicks=1
+✔ 坏步骤如实报错并中止（不假装跑完） — executed=2/3 error=node 不是 Control：/root/Main/DoesNotExist
+✔ continue_on_error=true 时继续跑后面的步骤 — executed=2 aborted=false
+✔ 未知步骤类型被明确拒绝 — 不支持的步骤类型 'no_such_action'（wait/press/release/tap/move/click/text/call）
+
+=== 运行时错误捕获 rt.errors ===
+✔ 错误记录器已装上 — recorder=true total=0
+✔ 捕获真实脚本运行时错误 — Out of bounds get index '2' (on base: 'Array')
+✔ 错误定位到用户脚本（而不是引擎内部的 variant_utility.cpp） — res://game.gd:47 in raise_error()
+✔ 带调用链 backtrace，且首帧就是出错的那一行 — [{"file":"res://game.gd","function":"raise_error","line":47},{"file":"res://addons/godot_mcp_bridge/runtime/godot_mcp_runtime.gd","function":"_act_step","line":1364}]
+✔ push_warning 也被捕获并归类为 warning — L3VERIFY_WARNING
+✔ 支持 since 增量读取（不重复拉全量） — returned=0 next_since=1
+✔ 支持按类型过滤 — returned=1
+
+=== 改坏代码后 rt.step 顺带汇报 ===
+✔ rt.step 汇报窗口内新增的错误数（改完代码立刻知道有没有炸） — errors_new=1 errors_total=3
+✔ 没有新错误时如实回 errors_new=0 — errors_new=0
+✔ rt.errors{clear} 清空缓冲 — cleared=1
+
+=== 收尾 ===
+✔ rt.quit 生效 — {"exit_code":0,"quitting":true}
+✔ 游戏进程已退出 — exitCode=0
+
+=== 零足迹注入 ===
+✖ auto 模式在未安装桥的项目上选到 transient（不需要先 setup） — EPERM: operation not permitted, open '~/.local/share/godot-mcp/transient.json'
+✔ 只多出 override.cfg 与 .godot/ 下的脚本 — override=true script=true
+✔ project.godot 全程一个字节都没变 — 与写入时逐字节比较
+✔ 零足迹注入的游戏把 9091 监听起来 — listening
+✔ 零足迹注入的桥真的可用 — frame=73
+✖ stop 后 override.cfg 与脚本目录都被清掉
+✖ stop 后项目目录恢复原状（只剩原有三个文件） — [".godot","game.gd","main.tscn","override.cfg","project.godot"]
+
+=== attach / detach ===
+✖ attach 只注入不启动（项目里出现 override.cfg，没有新进程） — EPERM: operation not permitted, open '~/.local/share/godot-mcp/transient.json'
+✔ attach 不动 project.godot — 逐字节比较
+✖ attach 条目出现在 session(list) 里（可发现、可撤销） — []
+✔ 外部启动的游戏被 attach 注入的桥接上 — listening
+✔ attach 后的游戏可被运行时工具控制，且 bridge 报 none（是它自己带起来的桥） — frame=75
+✔ detach 撤掉注入并把 project.godot 还原 — {"removedOverride":true,"removedScript":true}
+
+=== 汇总 ===
+通过 54/59
+  - auto 模式在未安装桥的项目上选到 transient（不需要先 setup）: "EPERM: operation not permitted, open '~/.local/share/godot-mcp/transient.json'"
+  - stop 后 override.cfg 与脚本目录都被清掉: undefined
+  - stop 后项目目录恢复原状（只剩原有三个文件）: "[\".godot\",\"game.gd\",\"main.tscn\",\"override.cfg\",\"project.godot\"]"
+  - attach 只注入不启动（项目里出现 override.cfg，没有新进程）: "EPERM: operation not permitted, open '~/.local/share/godot-mcp/transient.json'"
+  - attach 条目出现在 session(list) 里（可发现、可撤销）: "[]"

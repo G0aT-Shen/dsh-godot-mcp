@@ -1,0 +1,51 @@
+{
+  "name": "dsh-godot-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "为 DSH（以及任何 MCP 客户端）提供对 Godot 引擎的完整控制：无头操作层 + 编辑器实时层 + 运行中游戏层",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/G0aT-Shen/dsh-godot-mcp.git"
+  },
+  "homepage": "https://github.com/G0aT-Shen/dsh-godot-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/G0aT-Shen/dsh-godot-mcp/issues"
+  },
+  "exports": {
+    ".": "./boot.js",
+    "./package.json": "./package.json",
+    "./mcp": "./src/server.mjs"
+  },
+  "bin": {
+    "dsh-godot-mcp": "./bin/godot-mcp.mjs"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "test": "node --test test/unit.test.mjs test/plugin.test.mjs test/setup.test.mjs",
+    "verify": "node scripts/verify-e2e.mjs",
+    "verify:mcp": "node scripts/verify-mcp.mjs",
+    "verify:wiring": "node scripts/verify-wiring.mjs",
+    "verify:diagnostics": "node scripts/verify-diagnostics.mjs",
+    "verify:l2": "node scripts/verify-l2.mjs",
+    "verify:l3": "node scripts/verify-l3.mjs",
+    "verify:export": "node scripts/verify-export.mjs",
+    "mcp": "node bin/godot-mcp.mjs serve"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "mcp",
+    "godot",
+    "godot-engine",
+    "model-context-protocol"
+  ]
+}

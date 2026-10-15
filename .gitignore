@@ -1,0 +1,28 @@
+# 仓库只放源码与文档；下面这些不入库。
+
+# 依赖
+node_modules/
+
+# Godot 引擎二进制（500MB+，也超过 GitHub 单文件 100MB 限制）：
+# 用 `node scripts/setup.mjs` 检测本机已装的 Godot，或 `--download-godot` 拉到 tools/。
+tools/
+
+# 调研阶段 clone 的上游仓库（仅作阅读参考，不参与构建、不被导入）
+reference/
+
+# 示例 / 临时 Godot 项目
+demo-game/
+scratch-*/
+
+# Godot 运行产物（导入缓存、零足迹注入、导出物）
+.godot/
+.godot_mcp_tmp/
+mcp_tmp/
+*.import
+override.cfg
+override.cfg.mcp-backup
+dist/
+
+# 本机状态 / 编辑器
+.DS_Store
+*.bak-*

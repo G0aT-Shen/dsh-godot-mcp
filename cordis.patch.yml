@@ -1,0 +1,20 @@
+# dsh-godot-mcp —— DSH 原生插件用的 bundle patch（**当前未启用**）
+#
+# ★ 现状：本项目接入 DSH 的方式已经改成「标准 stdio MCP server + DSH 自带的
+#   dsh-mcp-client」，见 README「接入 DSH」。因此本包已从
+#   profile 的 dsh.profile.bundles 中移除，本文件当前不会被读取。
+#
+# 保留它的原因：包同时支持插件形态，若将来要重新启用，只需把包名加回
+# dsh.profile.bundles 即可（不要去改 profile 的 cordis.patch.yml 来"补"条目 ——
+# 那条路径按 id 打补丁，不会创建新条目）。
+#
+# ★ 若重新启用，请先读 verification/SUMMARY.md 第 7 节：插件形态在真实 DSH 里
+#   曾有「条目已组合进树、但工具一个都没注册」的问题，而所有本地测试仍然全绿。
+#
+# 加载链（供参考）：profile dependencies → dsh.profile.bundles → 本包 package.json
+# 的 dsh.bundle.patch → 本文件的 insert 条目 → 从 profile 的 node_modules 按包名 import。
+#
+- insert:
+    - id: godot-mcp
+      name: 'dsh-godot-mcp'
+      config: {}

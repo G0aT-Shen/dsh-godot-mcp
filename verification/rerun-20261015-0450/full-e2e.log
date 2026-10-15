@@ -1,0 +1,36 @@
+
+=== 0. 环境自检 ===
+✔ Godot 可执行文件可用 — 4.7.2.stable.official.ed1daf0bf
+✔ 无头操作引擎可用
+
+=== 1. 项目层 ===
+✔ create_project — {"created":true,"path":"/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-e2e-RBTHpI","renderer":"forward_plus"}
+✔ project_info 读到项目名 — E2E Verification
+
+=== 2. 场景与节点层 ===
+✔ create_scene — {"overwritten":false,"root_name":"Main","root_type":"Node2D","scene_path":"res://main.tscn"}
+✔ add_node(Sprite2D) — {"node_path":"Main/Hero","parent":"Main","scene_path":"res://main.tscn"}
+✔ add_node 到子路径 — {"node_path":"Main/Hero/Cam","parent":"Main/Hero","scene_path":"res://main.tscn"}
+✔ read_scene 能读回 Hero 与 Cam — ok
+
+=== 3. 脚本层 ===
+✔ write_file(hero.gd) — {"bytes":88,"encoding":"utf-8","path":"res://hero.gd"}
+✔ attach_script — {"node_path":"Main/Hero","scene_path":"res://main.tscn","script":"res://hero.gd"}
+✔ find_symbols 能列出 speed/_ready — {"classes":[],"exports":[],"extends":["Sprite2D"],"functions":["_ready"],"path":"res://hero.gd","signals":[],"variables":["speed"]}
+
+=== 4. 运行层 ===
+✔ write_settings 指定主场景 — {"changed":["application/run/main_scene"],"project_file":"/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-e2e-RBTHpI/project.godot"}
+✔ read_settings 读回主场景 — {"missing":[],"settings":{"application/run/main_scene":"res://main.tscn"},"source":"ProjectSettings"}
+✔ project.godot 里路径型设置是带引号的字符串（不是 Resource(...) 表达式） — run/main_scene="res://main.tscn"
+✔ run_project 正常返回（非看门狗超时） — exit=0 timed_out=false
+✔ 运行输出包含脚本打印的 HERO_READY — found
+
+=== 5. 逃生舱 ===
+✔ gdscript 逃生舱返回值正确 — {"duration_ms":4466,"exit_code":0,"mode":"MCP_RESULT","result":{"engine":"4.7.2-stable (official)","sum":2},"result_text":"{ \"engine\": \"4.7.2-stable (official)\", \"sum\": 2 }","stderr":"","stdout":"","timed_out":false}
+
+=== 6. 桥安装层 ===
+✔ godot_session(setup) 报告安装结果 — copied=2
+✔ project.godot 写入插件/autoload — {"editorPlugins":true,"autoload":true}
+
+=== 汇总 ===
+通过 19/19

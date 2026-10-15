@@ -1,0 +1,7 @@
+# 统一换行：仓库里的源码/脚本/文档一律 LF（Windows 侧 clone 后不会被 CRLF 污染）。
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.zip binary
+*.app binary

@@ -1,0 +1,19 @@
+✔ 探针自检：端口确实开着时，「不监听」判定必须失败（否则验收是空转） — 已正确识别为「开着」
+✔ 探针自检：端口开着时，「监听」判定成功 — true
+✔ 导出模板已安装 — 4.7.2.stable
+
+项目：/var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-export-CqV3jW
+
+✔ 桥已安装（autoload 指向 runtime 脚本）
+✔ 启用 ETC2 ASTC（macOS universal 导出的前置条件） — rendering/textures/vram_compression/import_etc2_astc
+✔ 导出产物真的存在于磁盘上 — /var/folders/js/pbg5q4456vl3_9q83zsf5mgc0000gn/T/godot-mcp-export-CqV3jW/dist/ExportGate.app/Contents/MacOS/ExportGate
+
+=== A. release 成品：9091 应当【不监听】 ===
+✔ release 成品长驻运行期间 9091 始终不监听 — 20s 内始终未监听
+
+=== B. 显式 opt-in：9091 应当【监听】 ===
+✔ opt-in 后 release 成品 9091 监听 — listening
+✔ opt-in 后 rt.eval 真的可执行（返回 42） — {"data":{"finished":true,"mcp_result":42,"result":42,"returned":true,"timed_out":false,"wrapped":true},"id":"v","ok":true,"op":"rt.eval"}
+
+=== 汇总 ===
+通过 9/9

@@ -1,0 +1,39 @@
+# 署名与第三方许可
+
+本项目（dsh-godot-mcp）采用 MIT 许可发布，全文见 [LICENSE](./LICENSE)。
+
+## 参考与复用的开源项目
+
+### Coding-Solo/godot-mcp
+
+- 仓库：https://github.com/Coding-Solo/godot-mcp
+- 许可：MIT
+- 版权：Copyright (c) 2025 Solomon Elias
+- 复用方式：本项目 L1 无头操作层（`godot/ops.gd`）的架构设计
+  （`extends SceneTree` + `--headless --script <op> <json>` 的调用约定）
+  以及 `create_scene` / `add_node` / `save_scene` / `resave_resources` 等操作的
+  实现思路来源于该项目。相关代码段保留了原始署名注释。
+
+### tugcantopaloglu/godot-mcp
+
+- 仓库：https://github.com/tugcantopaloglu/godot-mcp
+- 许可：MIT
+- 复用方式：本项目 L3 运行时桥（`godot/runtime/godot_mcp_runtime.gd`）
+  的 TCP 行分隔 JSON 协议与防重入（`_busy` 标志 + 超时自恢复）思路参考了该项目的
+  `mcp_interaction_server.gd`。
+
+### 上游仓库源码位置
+
+调研阶段 clone 的上游仓库（`Coding-Solo_godot-mcp` / `tugcantopaloglu_godot-mcp` /
+`hi-godot_godot-ai`）**不在本仓库内**（`.gitignore` 排除了 `reference/`）：
+它们只用于阅读参考，不参与构建、不被本项目代码导入。需要时按上面的地址自行 clone。
+
+## Godot 引擎
+
+本项目**不分发** Godot 引擎二进制。`tools/` 目录被 `.gitignore` 排除；用
+`node scripts/setup.mjs --download-godot` 可以下载官方未修改副本（默认 4.7.2-stable）
+到本地，或直接指向你已安装的 Godot：
+
+- 版本：Godot 4.7.2-stable (official, commit ed1daf0bf)
+- 来源：https://github.com/godotengine/godot/releases/tag/4.7.2-stable
+- 许可：MIT — Copyright (c) 2014-present Godot Engine contributors

@@ -1,0 +1,21 @@
+profile: ~/.dsh/profiles/desktop
+形态: 标准 stdio MCP（经 @deepseek-ai/dsh-mcp-client）
+
+✔ profile patch 是合法 YAML 数组
+✔ patch 的 insert 里有 godot-mcp-client — {"serverName":"godot","transport":"stdio","command":"$(command -v node)","args":["/U
+✔ 用的是 DSH 自带的 MCP 客户端 — @deepseek-ai/dsh-mcp-client
+✔ serverName 是 "godot" — godot
+✔ transport 是 stdio — stdio
+✔ command 是绝对路径 — $(command -v node)
+✔ command 存在且可执行 — $(command -v node)
+✔ args[0] 指向本项目 server 入口 — $REPO/bin/godot-mcp.mjs
+✔ server 入口就在本仓库内 — $REPO/bin/godot-mcp.mjs
+✔ toolCallTimeoutMs 足够长（> 60000） — 900000
+✔ 插件形态未激活（bundles 不含 @<scope>/godot-mcp） — 未激活
+✔ 按配置启动 server 并完成 initialize + tools/list — tools=5
+✔ 5 个工具都能列出（MCP 原始名） — godot, godot_batch, godot_session, godot_connect, godot_status
+✔ server 启动时没有 stderr 噪音 — 
+
+=== 汇总 ===
+通过 14/14
+结论：接线完整。工具会以 mcp__godot__<name> 暴露。
