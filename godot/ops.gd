@@ -45,6 +45,8 @@ const _TYPED_LITERAL_RE := "^(Vector2|Vector2i|Vector3|Vector3i|Vector4|Vector4i
 var _op := "(unknown)"
 var _params: Dictionary = {}
 var _root := ""            # absolute project dir as Godot resolved --path (normalized)
+var _script_file := ""      # this script path (from --script); used to locate the Node helper
+var _rng_seeded := false    # 临时产物名里的随机后缀只需要 seed 一次
 var _failed := false
 var _done := false         # quit() only raises a flag: handlers must not run on
 
@@ -66,6 +68,7 @@ func _init() -> void:
 		finish_error("usage: godot --headless --path <project> --script <ops.gd> <operation> <json_params>")
 		return
 
+	_script_file = str(args[script_index + 1])
 	_op = str(args[script_index + 2])
 	var raw_params := str(args[script_index + 3])
 
@@ -497,8 +500,31 @@ func collect_files(base_res: String, recursive: bool, exts: Array, out: Array, d
 # nested process helper (timeout-bounded, captures stdout/stderr separately)
 # --------------------------------------------------------------------------------------
 
-func sh_quote(s: String) -> String:
-	return "'" + s.replace("'", "'\\''") + "'"
+# --------------------------------------------------------------------------------------
+# nested process helper
+#
+# 嵌套 op（导入 / 导出 / run_project / deep parse_check / gdscript）需要再起一个 Godot，
+# 并且要能「限时、分离 stdout/stderr、拿到真实退出码、可取消、不留残留进程」。
+#
+# 旧实现写一个 `#!/bin/sh` 脚本再 OS.execute 调 /bin/sh，脚本里用 sleep/kill/pkill
+# 做看门狗 —— 原生 Windows 没有 /bin/sh，也没有 sleep/kill/pkill，这条路直接不可用。
+#
+# 现在的实现：**无 shell 的 Node 助手**（src/nested-helper.mjs）。
+#   * 用 OS.create_process 启动，参数逐字传递；实测 OS.execute 会把实参交给 shell
+#     （字面量 $HOME 会被展开），所以哪怕只是传路径也不走它；
+#   * 嵌套命令与参数只写进 JSON 请求文件，命令行上只有「Node 绝对路径 + 助手路径 + 请求文件」；
+#   * 助手内部 spawn(exe, args, shell:false, detached:false)：不经 shell；
+#     Godot 启动助手会另建进程组，清理需覆盖完整后代树，不能只杀外层进程组；
+#   * 助手自己限时并在超时时杀树，再写结果文件；外层只轮询结果文件，超时则按 pid 杀树兜底。
+# --------------------------------------------------------------------------------------
+
+## Node 绝对路径由 MCP server 每次注入，固定嵌套执行使用的版本与路径。
+const HELPER_NODE_ENV := "GODOT_MCP_NODE"
+## 助手脚本绝对路径（默认取仓库里的 src/nested-helper.mjs）。
+const HELPER_PATH_ENV := "GODOT_MCP_HELPER"
+## 结果文件轮询间隔与额外宽限：助手自己已经超时杀树，这里只等它把结果写完。
+const CAPTURE_POLL_MS := 25
+const CAPTURE_RESULT_MARGIN_MS := 20000
 
 ## 助手脚本可以落在哪些目录（按优先级）。
 ##
@@ -522,96 +548,369 @@ func helper_dirs() -> Array:
 func spawn_error_message(run: Dictionary, what: String) -> String:
 	return what + " 没能执行：" + str(run.get("error", "")) + "；" + str(run.get("hint", ""))
 
-func sh_capture(parts: Array, timeout_sec: float) -> Dictionary:
-	var stamp := str(Time.get_ticks_usec())
-	var timeout_int := int(max(1.0, ceil(timeout_sec)))
+func _capture_spawn_error(reason: String, error: String, hint: String, tried: Array = []) -> Dictionary:
+	var out := {
+		"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 0,
+		"timed_out": false, "spawn_error": true, "reason": reason,
+		"error": error, "hint": hint,
+	}
+	if tried.size() > 0:
+		out["tried"] = tried
+	return out
 
-	var cmd := ""
-	for i in parts.size():
-		if i > 0:
-			cmd += " "
-		cmd += sh_quote(str(parts[i]))
+## PATH 里的 node 名称：Windows 上真正可执行的是 node.exe。
+func _node_names() -> Array:
+	if OS.get_name() == "Windows":
+		return ["node.exe", "node.cmd", "node.bat", "node"]
+	return ["node"]
 
-	# 先把助手脚本写进一个真正可写的目录，写不进去就换下一个候选。
+## 在 PATH 里找 node（退路；首选是 server 注入的 GODOT_MCP_NODE）。
+func _which_node() -> String:
+	var path_env := OS.get_environment("PATH")
+	var sep := ";" if OS.get_name() == "Windows" else ":"
+	for entry in path_env.split(sep, false):
+		for name in _node_names():
+			var candidate := str(entry).strip_edges().path_join(name)
+			if FileAccess.file_exists(candidate):
+				return candidate
+	return ""
+
+func resolve_node_exe() -> String:
+	var explicit := OS.get_environment(HELPER_NODE_ENV).strip_edges()
+	if not explicit.is_empty():
+		# 显式指定是严格的：写了却不存在就直接报错，不悄悄换一个 Node。
+		return explicit if FileAccess.file_exists(explicit) else ""
+	return _which_node()
+
+func _ops_script_dir() -> String:
+	if _script_file.is_empty():
+		return ""
+	return _script_file.get_base_dir()
+
+func resolve_helper_script() -> String:
+	var explicit := OS.get_environment(HELPER_PATH_ENV).strip_edges()
+	if not explicit.is_empty():
+		return explicit if FileAccess.file_exists(explicit) else ""
+	var here := _ops_script_dir()
+	if here.is_empty():
+		return ""
+	var candidate := here.path_join("..").path_join("src").path_join("nested-helper.mjs").simplify_path()
+	return candidate if FileAccess.file_exists(candidate) else ""
+
+## 本次调用的唯一临时产物集合；写不进去就换下一个候选目录。
+func _prepare_capture_files() -> Dictionary:
+	if not _rng_seeded:
+		randomize()
+		_rng_seeded = true
+	# 唯一性 = 微秒时间戳 + 进程 id + 随机后缀：同一进程内并发/重入也不会撞名
+	var stamp := str(Time.get_ticks_usec()) + "-" + str(OS.get_process_id()) + "-" + str(randi() % 1000000)
 	var tried: Array = []
-	var chosen: Dictionary = {}
 	for dir in helper_dirs():
 		var dir_s := str(dir)
 		DirAccess.make_dir_recursive_absolute(dir_s)
 		if not DirAccess.dir_exists_absolute(dir_s):
 			tried.append({"dir": dir_s, "error": "cannot create directory"})
 			continue
-		var cand_sh := dir_s.path_join("capture_" + stamp + ".sh")
-		var cand_out := dir_s.path_join("out_" + stamp + ".txt")
-		var cand_err := dir_s.path_join("err_" + stamp + ".txt")
-		var cand_rc := dir_s.path_join("rc_" + stamp + ".txt")
-
-		# The watchdog script is stored in a FILE and executed as `sh <file>` on purpose:
-		# Godot's OS.execute wraps its arguments in an extra `sh -c "..."` layer on macOS,
-		# which would expand $!, $? and $vars before our script ever runs.
-		var script := "#!/bin/sh\n"
-		script += cmd + " > " + sh_quote(cand_out) + " 2> " + sh_quote(cand_err) + " &\n"
-		script += "__mcp_pid=$!\n"
-		script += "( sleep " + str(timeout_int) + "; kill -9 $__mcp_pid 2>/dev/null ) >/dev/null 2>&1 &\n"
-		script += "__mcp_wd=$!\n"
-		script += "wait $__mcp_pid\n"
-		script += "__mcp_ec=$?\n"
-		script += "kill -9 $__mcp_wd 2>/dev/null\n"
-		script += "pkill -9 -P $__mcp_wd 2>/dev/null\n"
-		script += "echo $__mcp_ec > " + sh_quote(cand_rc) + "\n"
-
-		var sf := FileAccess.open(cand_sh, FileAccess.WRITE)
-		if sf == null:
+		var files := {
+			"dir": dir_s,
+			"req": dir_s.path_join("capture_" + stamp + ".json"),
+			"out": dir_s.path_join("out_" + stamp + ".txt"),
+			"err": dir_s.path_join("err_" + stamp + ".txt"),
+			"result": dir_s.path_join("result_" + stamp + ".json"),
+			"status": dir_s.path_join("status_" + stamp + ".json"),
+		}
+		var probe := FileAccess.open(str(files["req"]), FileAccess.WRITE)
+		if probe == null:
 			tried.append({"dir": dir_s, "error": error_string(FileAccess.get_open_error())})
 			continue
-		sf.store_string(script)
-		sf.close()
-		chosen = {"dir": dir_s, "sh": cand_sh, "out": cand_out, "err": cand_err, "rc": cand_rc}
-		break
+		probe.close()
+		files["tried"] = tried
+		return files
+	return {"error": true, "tried": tried}
 
-	if chosen.is_empty():
-		return {
-			"stdout": "", "stderr": "", "exit_code": -1, "duration_ms": 0,
-			"shell_exit": -1, "timed_out": false,
-			"spawn_error": true, "reason": "helper_script_unwritable",
-			"error": "连一个可写的助手脚本目录都没有",
-			"tried": tried,
-			"hint": "逐个检查权限（沙箱/只读 HOME/CI 容器会让 user:// 不可写）：" + JSON.stringify(tried) +
-				"；也可以用 " + HELPER_DIR_ENV + " 显式指向一个可写目录。",
-		}
+## 清理本次调用的临时产物；Windows 上文件可能被还没退出的进程占着，所以要有限重试。
+## 返回删不掉的文件列表（调用方如实上报，而不是假装干净）。
+func _remove_capture_files(files: Dictionary) -> Array:
+	var failed: Array = []
+	for key in ["req", "out", "err", "result", "status"]:
+		if not files.has(key):
+			continue
+		# 结果文件是「先写 <name>.tmp 再 rename」的原子写：硬杀时 .tmp 会留下，
+		# 所以清理必须把 .tmp 兄弟文件一起收掉（否则每次异常都在临时目录里攒垃圾）。
+		for path in [str(files[key]), str(files[key]) + ".tmp"]:
+			if not FileAccess.file_exists(path):
+				continue
+			for attempt in range(5):
+				if DirAccess.remove_absolute(path) == OK:
+					break
+				OS.delay_msec(100)
+			if FileAccess.file_exists(path):
+				failed.append(path)
+	return failed
 
-	var sh_path := str(chosen["sh"])
-	var out_path := str(chosen["out"])
-	var err_path := str(chosen["err"])
-	var rc_path := str(chosen["rc"])
+## 等待若干 pid 真的退出（有界）。返回 {alive, waited_ms}。
+## 只在 Windows 与 Unix 上可用（OS.is_process_running 的平台限制）；
+## 它在本进程不是父进程时会打一行引擎错误 —— 那行正好说明「已经退出了」，可接受。
+func _wait_processes_exit(pids: Array, timeout_ms: int) -> Dictionary:
+	var wanted: Array = []
+	for pid in pids:
+		if int(pid) > 0:
+			wanted.append(int(pid))
+	if wanted.is_empty():
+		return {"alive": [], "waited_ms": 0}
+	var started := Time.get_ticks_msec()
+	var alive: Array = []
+	while true:
+		alive = []
+		for pid in wanted:
+			if OS.is_process_running(pid):
+				alive.append(pid)
+		if alive.is_empty() or Time.get_ticks_msec() - started >= timeout_ms:
+			break
+		OS.delay_msec(50)
+	return {"alive": alive, "waited_ms": Time.get_ticks_msec() - started}
+
+func _run_windows_taskkill(pid: int) -> bool:
+	var root := OS.get_environment("SystemRoot").strip_edges()
+	if root.is_empty():
+		root = "C:\\Windows"
+	var taskkill := root.path_join("System32").path_join("taskkill.exe")
+	if not FileAccess.file_exists(taskkill):
+		return false
+	var kill_args := PackedStringArray()
+	kill_args.append("/PID")
+	kill_args.append(str(pid))
+	kill_args.append("/T")
+	kill_args.append("/F")
+	return OS.create_process(taskkill, kill_args, false) > 0
+
+## 用 Node 助手做「杀树」（无 shell）：先按 pid 快照整棵子树，再逐个回收并确认。
+##
+## 为什么需要它：Godot 给 OS.create_process 起的进程**新建进程组**，POSIX 上
+## `OS.kill(child)` 只杀一个 pid，孙进程会漏；而进程组又覆盖不到（组不同）。
+## Node 侧用 ps 快照父子关系，是这里唯一可靠的整树回收方式。
+func _run_node_kill_mode(roots: Array, timeout_ms: int) -> Dictionary:
+	var node := resolve_node_exe()
+	var helper := resolve_helper_script()
+	if node.is_empty() or helper.is_empty():
+		return {"ok": false, "error": "node 或 helper 不可用，无法整树回收"}
+	var files := _prepare_capture_files()
+	if files.get("error", false) == true:
+		return {"ok": false, "error": "没有可写的助手目录", "tried": files.get("tried", [])}
+	var wanted: Array = []
+	for pid in roots:
+		if int(pid) > 0:
+			wanted.append(int(pid))
+	var request := {"roots": wanted, "timeoutMs": timeout_ms, "resultPath": str(files["result"])}
+	var handle := FileAccess.open(str(files["req"]), FileAccess.WRITE)
+	if handle == null:
+		_remove_capture_files(files)
+		return {"ok": false, "error": "写不进 kill 请求文件"}
+	handle.store_string(JSON.stringify(request))
+	handle.close()
+	var kill_pid := OS.create_process(node, PackedStringArray([helper, "--kill", str(files["req"])]), false)
+	if kill_pid <= 0:
+		_remove_capture_files(files)
+		return {"ok": false, "error": "启动 Node 杀树助手失败"}
+	var deadline := Time.get_ticks_msec() + timeout_ms + 5000
+	while not FileAccess.file_exists(str(files["result"])) and Time.get_ticks_msec() < deadline:
+		OS.delay_msec(CAPTURE_POLL_MS)
+	var out := {"ok": false, "error": "Node 杀树助手超时未返回结果", "killer_pid": kill_pid}
+	if FileAccess.file_exists(str(files["result"])):
+		var parsed = JSON.parse_string(FileAccess.get_file_as_string(str(files["result"])))
+		if typeof(parsed) == TYPE_DICTIONARY:
+			out = parsed
+		else:
+			out = {"ok": false, "error": "杀树结果不是合法 JSON", "killer_pid": kill_pid}
+	_remove_capture_files(files)
+	out["killer_pid"] = kill_pid
+	return out
+
+## 外层兜底：助手卡住时按 pid 杀树，并**有界等待确认**（不是发完就当成功）。
+##
+## Windows：必须在根进程还活着时用 taskkill 的树模式（父子关系是现场枚举的）；
+##   若助手已经退出，就改为对**嵌套子进程**做树杀（它自己还有后代）。
+## POSIX：交给 Node 杀树助手（见上），不再用 OS.kill 逐个 pid 了事。
+## 返回 {ok, method, helper_pid, child_pid, helper_exited, alive, waited_ms, attempts, ...}：
+## ok=false 且 alive 非空意味着**确实有残留**，调用方必须如实上报。
+func _kill_capture_tree(helper_pid: int, status_path: String) -> Dictionary:
+	var child_pid := 0
+	if FileAccess.file_exists(status_path):
+		var status = JSON.parse_string(FileAccess.get_file_as_string(status_path))
+		if typeof(status) == TYPE_DICTIONARY:
+			child_pid = int(status.get("pid", 0))
+	var helper_exited := helper_pid > 0 and not OS.is_process_running(helper_pid)
+	var method := ""
+	var attempts := 0
+	var waited := {"alive": [], "waited_ms": 0}
+	var kill_mode := {}
+	if OS.get_name() == "Windows":
+		method = "taskkill-tree"
+		# 根进程必须还活着才能按关系枚举后代：优先助手，助手已退出就退回嵌套子进程
+		var root := helper_pid
+		if helper_exited:
+			root = child_pid
+		if root > 0 and _run_windows_taskkill(root):
+			attempts += 1
+		waited = _wait_processes_exit([helper_pid, child_pid], 8000)
+		if not (waited["alive"] as Array).is_empty():
+			# 有限重试一次：taskkill 偶尔会因为句柄/时序没杀干净
+			if root > 0 and _run_windows_taskkill(root):
+				attempts += 1
+			waited = _wait_processes_exit([helper_pid, child_pid], 4000)
+	else:
+		method = "node-kill-mode"
+		kill_mode = _run_node_kill_mode([helper_pid, child_pid], 8000)
+		attempts += 1
+		waited = _wait_processes_exit([helper_pid, child_pid], 4000)
+	var alive: Array = waited["alive"]
+	return {
+		"ok": alive.is_empty(),
+		"method": method,
+		"helper_pid": helper_pid,
+		"child_pid": child_pid,
+		"helper_exited": helper_exited,
+		"alive": alive,
+		"waited_ms": waited["waited_ms"],
+		"attempts": attempts,
+		"kill_mode": kill_mode,
+	}
+
+## 执行嵌套命令并收集输出。
+## 返回的字段与旧实现保持兼容：stdout / stderr / exit_code / duration_ms / timed_out /
+## spawn_error / reason / error / hint / helper_dir，另加 killed / still_running / orphaned / signal。
+func run_capture(parts: Array, timeout_sec: float) -> Dictionary:
+	if parts.is_empty():
+		return _capture_spawn_error("empty_command", "嵌套执行的命令为空", "")
+	var node := resolve_node_exe()
+	if node.is_empty():
+		return _capture_spawn_error(
+			"node_not_found",
+			"找不到 Node 可执行文件（嵌套执行需要它）",
+			"MCP server 每次调用都会注入 " + HELPER_NODE_ENV + "=Node 的绝对路径；" +
+			"手动跑 ops.gd 时请自行设置该变量，或把 node 放进 PATH（需要 Node 20+）。")
+	var helper := resolve_helper_script()
+	if helper.is_empty():
+		return _capture_spawn_error(
+			"helper_missing",
+			"找不到嵌套执行助手脚本（src/nested-helper.mjs）",
+			"默认按 ops.gd 所在仓库定位；也可以用 " + HELPER_PATH_ENV + " 显式指定绝对路径。")
+
+	var files := _prepare_capture_files()
+	if files.get("error", false) == true:
+		var tried: Array = files.get("tried", [])
+		return _capture_spawn_error(
+			"helper_script_unwritable",
+			"连一个可写的助手目录都没有",
+			"逐个检查权限（沙箱/只读 HOME/CI 容器会让 user:// 不可写）：" + JSON.stringify(tried) +
+			"；也可以用 " + HELPER_DIR_ENV + " 显式指向一个可写目录。",
+			tried)
+
+	var args := []
+	for i in range(1, parts.size()):
+		args.append(str(parts[i]))
+	var timeout_int := int(max(1.0, ceil(timeout_sec)))
+	var request := {
+		"exe": str(parts[0]),
+		"args": args,
+		"cwd": _root,
+		"timeoutMs": timeout_int * 1000,
+		"outPath": str(files["out"]),
+		"errPath": str(files["err"]),
+		"resultPath": str(files["result"]),
+		"statusPath": str(files["status"]),
+	}
+	var handle := FileAccess.open(str(files["req"]), FileAccess.WRITE)
+	if handle == null:
+		_remove_capture_files(files)
+		return _capture_spawn_error("helper_request_unwritable", "写不进请求文件 " + str(files["req"]), error_string(FileAccess.get_open_error()))
+	handle.store_string(JSON.stringify(request))
+	handle.close()
 
 	var started := Time.get_ticks_msec()
-	var shell_ec := OS.execute("/bin/sh", PackedStringArray([sh_path]), [], false)
-	var duration_ms := Time.get_ticks_msec() - started
+	var helper_pid := OS.create_process(node, PackedStringArray([helper, str(files["req"])]), false)
+	if helper_pid <= 0:
+		_remove_capture_files(files)
+		return _capture_spawn_error("helper_spawn_failed", "启动 Node 助手失败：" + node, "检查 node 是否可执行、请求文件是否可读。")
+
+	# 等结果文件：助手自己会在 timeoutMs 后杀树并写结果，这里多给一段余量。
+	var deadline := started + timeout_int * 1000 + CAPTURE_RESULT_MARGIN_MS
+	while not FileAccess.file_exists(str(files["result"])) and Time.get_ticks_msec() < deadline:
+		OS.delay_msec(CAPTURE_POLL_MS)
 
 	var stdout := ""
 	var stderr := ""
-	var exit_code := 137
-	if FileAccess.file_exists(out_path):
-		stdout = FileAccess.get_file_as_string(out_path)
-	if FileAccess.file_exists(err_path):
-		stderr = FileAccess.get_file_as_string(err_path)
-	if FileAccess.file_exists(rc_path):
-		exit_code = int(FileAccess.get_file_as_string(rc_path).strip_edges().to_int())
-	for p in [out_path, err_path, rc_path, sh_path]:
-		if FileAccess.file_exists(p):
-			DirAccess.remove_absolute(p)
+	if FileAccess.file_exists(str(files["out"])):
+		stdout = FileAccess.get_file_as_string(str(files["out"]))
+	if FileAccess.file_exists(str(files["err"])):
+		stderr = FileAccess.get_file_as_string(str(files["err"]))
 
-	return {
+	if not FileAccess.file_exists(str(files["result"])):
+		# 助手没能在期限内写出结果：按 pid **有界**杀树，并如实报告「输出可能不完整、
+		# 是否还有残留、哪些临时文件没清掉」。发完信号就宣布成功是这里最容易犯的错。
+		var kill := _kill_capture_tree(helper_pid, str(files["status"]))
+		var leftover := _remove_capture_files(files)
+		var killed: Dictionary = {
+			"stdout": stdout, "stderr": stderr, "exit_code": 137,
+			"duration_ms": Time.get_ticks_msec() - started,
+			"timed_out": true, "spawn_error": false, "reason": "helper_timeout",
+			"helper_dir": str(files["dir"]), "helper_pid": helper_pid,
+			"tree_kill": kill, "still_running": not bool(kill["ok"]),
+			"error": "Node 助手超时未返回结果（已按 pid 杀树）",
+			"hint": "如果反复出现，检查 " + HELPER_DIR_ENV + " 指向的目录是否可写、磁盘是否已满。",
+		}
+		if not leftover.is_empty():
+			killed["leftover_files"] = leftover
+		return killed
+
+	# 结果文件已经落盘，但助手可能还没退出（它写完结果才 exit）。Windows 上文件句柄
+	# 还没释放时删除会失败，所以先有界等它退出，再带重试地清理临时产物。
+	var helper_exit := _wait_processes_exit([helper_pid], 5000)
+	var raw := FileAccess.get_file_as_string(str(files["result"]))
+	var leftover := _remove_capture_files(files)
+	var parsed = JSON.parse_string(raw)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return _capture_spawn_error(
+			"helper_result_unreadable",
+			"助手结果文件不是合法 JSON：" + raw.substr(0, 300),
+			"结果文件已删除；重跑一次可确认是否偶发。")
+
+	var duration_ms := int(parsed.get("durationMs", Time.get_ticks_msec() - started))
+	if bool(parsed.get("spawnError", false)):
+		var out := _capture_spawn_error(
+			"exe_spawn_failed",
+			"嵌套命令没能启动：" + str(parsed.get("error", "")),
+			"检查可执行文件路径与权限：" + str(parts[0]))
+		out["stderr"] = stderr
+		out["stdout"] = stdout
+		return out
+
+	var exit_code := 137
+	if parsed.get("exitCode") != null:
+		exit_code = int(parsed["exitCode"])
+	var timed_out := bool(parsed.get("timedOut", false))
+	if timed_out:
+		# 与旧实现一致：看门狗超时统一以 137 上报，Node 层据此判「被超时终止」。
+		exit_code = 137
+	var out := {
 		"stdout": stdout,
 		"stderr": stderr,
 		"exit_code": exit_code,
 		"duration_ms": duration_ms,
-		"shell_exit": shell_ec,
-		"timed_out": exit_code == 137,
+		"timed_out": timed_out,
 		"spawn_error": false,
-		"helper_dir": str(chosen["dir"]),
+		"signal": parsed.get("signal", null),
+		"helper_dir": str(files["dir"]),
+		"helper_pid": helper_pid,
+		"helper_exited": (helper_exit["alive"] as Array).is_empty(),
+		"killed": bool(parsed.get("killed", false)),
+		"still_running": bool(parsed.get("stillRunning", false)),
+		"orphaned": bool(parsed.get("orphaned", false)),
 	}
+	# GDScript 的字典字面量没有展开语法，只能事后补键
+	if not leftover.is_empty():
+		out["leftover_files"] = leftover
+	return out
 
 func godot_exe() -> String:
 	return OS.get_executable_path()
@@ -1620,7 +1919,7 @@ func _op_import_assets() -> void:
 	if stop():
 		return
 	var requested := opt_array("paths")
-	var run := sh_capture([godot_exe(), "--headless", "--path", _root, "--import"], IMPORT_TIMEOUT)
+	var run := run_capture([godot_exe(), "--headless", "--path", _root, "--import"], IMPORT_TIMEOUT)
 	# 嵌套 --import 没跑起来时，下面那些「找到了 .import 文件」只是磁盘上的旧状态，
 	# 报成「导入成功」就是假成功。
 	if bool(run.get("spawn_error", false)):
@@ -1702,7 +2001,7 @@ func _op_export_project() -> void:
 			return
 
 	var flag := "--export-debug" if debug else "--export-release"
-	var run := sh_capture([godot_exe(), "--headless", "--path", _root, flag, preset, out_abs], EXPORT_TIMEOUT)
+	var run := run_capture([godot_exe(), "--headless", "--path", _root, flag, preset, out_abs], EXPORT_TIMEOUT)
 	if bool(run.get("spawn_error", false)):
 		finish_error(spawn_error_message(run, "export_project 的嵌套 --export"))
 		return
@@ -1794,7 +2093,7 @@ func _op_run_project() -> void:
 	var headless := opt_bool("headless", true)
 	var scene_arg := opt_str("scene")
 	# `quit_after` is in seconds (default 10, clamped to 1..600); the game is bounded by
-	# Godot's own --quit-after frame counter and by the watchdog in sh_capture().
+	# Godot's own --quit-after frame counter and by the watchdog inside run_capture().
 	var quit_after := float(opt_int("quit_after", int(DEFAULT_RUN_QUIT_AFTER)))
 	quit_after = clampf(quit_after, 1.0, MAX_RUN_QUIT_AFTER)
 	var frames := int(round(quit_after * 60.0))
@@ -1811,7 +2110,7 @@ func _op_run_project() -> void:
 			return
 		argv.append(scene_res)
 
-	var run := sh_capture(argv, quit_after + 30.0)
+	var run := run_capture(argv, quit_after + 30.0)
 	if bool(run.get("spawn_error", false)):
 		# 旧实现在这里只回一句 "cannot create helper script"，调用方读到的是「游戏没输出」，
 		# 既不像失败也不知怎么修。
@@ -1886,26 +2185,49 @@ func _op_parse_check() -> void:
 	var groups := {}
 	var order: Array = []
 	var attempts := 0
+	var checks_failed := 0
 	for path in suspicious:
 		if attempts >= NESTED_CHECK_ATTEMPTS:
 			var cap_key := "cap|" + str(path)
 			groups[cap_key] = {
 				"path": str(path), "origin": str(path), "line": 0,
 				"message": "not re-checked (attempt cap reached)",
-				"cascade": false, "affects": [str(path)],
+				"cascade": false, "affects": [str(path)], "check_failed": true,
 			}
 			order.append(cap_key)
+			checks_failed += 1
 			continue
 		attempts += 1
 		# `--check-only` exits 0 even for a script that fails to parse, so the verdict
 		# has to come from stderr, not from the exit code.
-		var run := sh_capture([godot_exe(), "--headless", "--path", _root, "--check-only", "--script", str(path)], 60.0)
+		var run := run_capture([godot_exe(), "--headless", "--path", _root, "--check-only", "--script", str(path)], 60.0)
 		if bool(run.get("spawn_error", false)):
 			# 嵌套检查一个文件都没跑成 —— 这时**必须**报错：返回「0 个错误」等于告诉调用方
 			# 「代码是干净的」，而实际上没有任何文件被真正检查过（真机踩到过这次）。
 			finish_error(spawn_error_message(run, "deep parse_check 的逐文件 --check-only"))
 			return
 		var combined := str(run["stderr"]) + "\n" + str(run["stdout"])
+		# 只有「真正跑完且正常退出」的那次检查，其 stderr 才能当作语法结论。
+		# 超时（137）、异常退出、孤儿/残留进程都意味着这个文件的检查**没完成** ——
+		# 这时把 errors 留空就是在谎报「干净」。显式记成 check_failed 并计数。
+		var trust = int(run["exit_code"]) == 0 \
+			and not bool(run.get("timed_out", false)) \
+			and not bool(run.get("orphaned", false)) \
+			and not bool(run.get("still_running", false))
+		if not trust:
+			var fail_key := "failed|" + str(path)
+			groups[fail_key] = {
+				"path": str(path), "origin": str(path), "line": 0,
+				"message": "check did not complete: exit=%d timed_out=%s orphaned=%s still_running=%s" % [
+					int(run["exit_code"]), str(bool(run.get("timed_out", false))),
+					str(bool(run.get("orphaned", false))), str(bool(run.get("still_running", false))),
+				],
+				"cascade": false, "affects": [str(path)], "check_failed": true,
+				"stderr_tail": _tail(combined, 800),
+			}
+			order.append(fail_key)
+			checks_failed += 1
+			continue
 		if not _looks_like_engine_error(combined):
 			continue  # in-process probe was a false positive (e.g. unresolved preload)
 		for err in _parse_godot_errors(combined, str(path)):
@@ -1938,6 +2260,10 @@ func _op_parse_check() -> void:
 		"unique_errors": errors.size(),
 		"cascade_errors": cascade_count,
 		"deep": deep,
+		# 「有几个文件的检查根本没跑完」必须显式可见：调用方看到 0 errors 时，
+		# 只有同时看到 incomplete=false 才能认为代码是干净的。
+		"checks_failed": checks_failed,
+		"incomplete": checks_failed > 0,
 	})
 
 func _error_sort(a: Dictionary, b: Dictionary) -> bool:
@@ -2073,7 +2399,7 @@ func _op_gdscript() -> void:
 		timeout = DEFAULT_ESCAPE_TIMEOUT
 	timeout = clampf(timeout, 1.0, 300.0)
 
-	var run := sh_capture(
+	var run := run_capture(
 		[godot_exe(), "--headless", "--path", _root, "--script", script_abs, "--quit-after", "600"],
 		timeout
 	)

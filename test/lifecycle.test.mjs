@@ -10,15 +10,63 @@ import net from 'node:net';
 import { GodotController } from '../src/server.mjs';
 import { injectTransientBridge, restoreTransientBridge, pendingInjections } from '../src/inject.mjs';
 import { startMcpServer } from '../src/mcp-stdio.mjs';
-import { runProcess } from '../src/godot.mjs';
+import { godotPath, runProcess } from '../src/godot.mjs';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-async function until(predicate) {
-  const deadline = Date.now() + 2000;
+async function until(predicate, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
-    assert.ok(Date.now() < deadline, 'condition did not become true');
-    await delay(10);
+    assert.ok(Date.now() < deadline, `condition did not become true within ${timeoutMs}ms`);
+    await delay(25);
   }
+}
+
+/**
+ * 真实 Godot 夹具项目。
+ *
+ * 为什么不再用「带 shebang 的假引擎」：Windows 既不认 `#!` 也没有可执行位，
+ * 旧夹具只能在 POSIX 上跑，于是三个关键生命周期用例在 win32 上被**静默跳过** ——
+ * 而「自然退出、按 kind 停止、同项目共享注入」恰恰是最需要在 Windows 上验证的部分。
+ * 现在改用真实 Godot + 一个最小项目：`--headless` 原生可跑，且用 `exit-now`
+ * 参数控制自然退出，语义与旧夹具一致。
+ */
+function fixtureProject(root) {
+  return { project: path.join(root, 'project'), binary: undefined };
+}
+
+async function writeFixtureProject(project) {
+  await fs.mkdir(project, { recursive: true });
+  await fs.writeFile(path.join(project, 'project.godot'), [
+    'config_version=5',
+    '',
+    '[application]',
+    'config/name="mcp-lifecycle-fixture"',
+    'run/main_scene="res://main.tscn"',
+    '',
+  ].join('\n'));
+  // 用 `--` 之后的**用户参数**（OS.get_cmdline_user_args）而不是普通引擎参数：
+  // 把自定义参数直接塞进引擎参数列表，Godot 会当成未知引擎参数并报错退出 ——
+  // 那样「自然退出」其实是被参数错误打死的，测试就变成了假通过。
+  await fs.writeFile(path.join(project, 'main.gd'), [
+    'extends Node',
+    '',
+    'func _ready() -> void:',
+    '\tprint("READY")',
+    '\tfor argument in OS.get_cmdline_user_args():',
+    '\t\tif argument == "exit-now":',
+    '\t\t\tget_tree().quit(0)',
+    '\t\t\treturn',
+    '',
+  ].join('\n'));
+  await fs.writeFile(path.join(project, 'main.tscn'), [
+    '[gd_scene load_steps=2 format=3]',
+    '',
+    '[ext_resource type="Script" path="res://main.gd" id="1"]',
+    '',
+    '[node name="Main" type="Node"]',
+    'script = ExtResource("1")',
+    '',
+  ].join('\n'));
 }
 
 async function fixture(t) {
@@ -31,14 +79,28 @@ async function fixture(t) {
     await fs.rm(root, { recursive: true, force: true });
   });
   const project = path.join(root, 'project');
-  await fs.mkdir(project);
-  await fs.writeFile(path.join(project, 'project.godot'), 'config_version=5\n');
-  const binary = path.join(root, 'fake-godot');
-  await fs.writeFile(binary, `#!${process.execPath}\nprocess.stdout.write('READY\\n');\nif (process.argv.includes('exit-now')) process.exit(0);\nsetInterval(() => {}, 1000);\n`, { mode: 0o755 });
-  const controller = new GodotController({ godotPath: binary, defaultProject: project });
+  await writeFixtureProject(project);
+  const controller = new GodotController({ godotPath: requireRealGodot(), defaultProject: project });
   const dispose = async () => { await controller.shutdown(); };
   return { root, project, controller, dispose };
 }
+
+/**
+ * 真实 Godot 是本组用例的前置条件。没有就明确跳过（而不是静默通过），
+ * 并且在 CI 里用 GODOT_MCP_REQUIRE_GODOT=1 把跳过升级为失败 —— 关键生命周期用例
+ * 不允许在 CI 上悄悄消失。
+ */
+function requireRealGodot() {
+  const binary = godotPath();
+  if (binary) return binary;
+  if (process.env.GODOT_MCP_REQUIRE_GODOT === '1') {
+    assert.fail('CI 要求真实 Godot（GODOT_MCP_REQUIRE_GODOT=1），但没有找到可执行文件');
+  }
+  return undefined;
+}
+
+const REAL_GODOT_SKIP = process.env.GODOT_MCP_REQUIRE_GODOT === '1' || godotPath() ? false : 'no real Godot available';
+const REAL_SKIP_NOTE = '没有可用的 Godot 可执行文件（设置 GODOT_MCP_GODOT 或把 Godot 放进 PATH）';
 
 test('repeated recovery preserves the original override through final cleanup', async t => {
   const f = await fixture(t);
@@ -50,25 +112,35 @@ test('repeated recovery preserves the original override through final cleanup', 
   assert.deepEqual(await pendingInjections(), []);
 });
 
-test('natural process exit cleans injection without an explicit stop', { skip: process.platform === 'win32' }, async t => {
+test('natural process exit cleans injection without an explicit stop', { skip: REAL_GODOT_SKIP && REAL_SKIP_NOTE }, async t => {
   const f = await fixture(t);
   try {
-    const child = await f.controller.processes.startGame({ project: f.project, godot: f.controller.config.godotPath, keepAwake: false, extraArgs: ['exit-now'] });
+    const child = await f.controller.processes.startGame({
+      project: f.project,
+      godot: f.controller.config.godotPath,
+      keepAwake: false,
+      headless: true,
+      extraArgs: ['--', 'exit-now'],
+    });
+    // 先确认游戏真的起来了（READY），再等它自己退出，并且退出码必须是 0 ——
+    // 「参数报错被打死」也会退出，那不是自然退出。
+    await until(() => child.stdout.includes('READY'), 60_000);
     if (child.running) await once(child, 'exit');
+    assert.equal(child.exitCode, 0, `自然退出必须是 0，实际 ${child.exitCode}；stderr=${child.stderr.slice(-400)}`);
     await child.bridgeCleanup;
     assert.equal(existsSync(path.join(f.project, '.godot/mcp_bridge')), false);
     assert.deepEqual(await pendingInjections(), []);
   } finally { await f.dispose(); }
 });
 
-test('stop by kind waits for injection cleanup and restores user configuration', { skip: process.platform === 'win32' }, async t => {
+test('stop by kind waits for injection cleanup and restores user configuration', { skip: REAL_GODOT_SKIP && REAL_SKIP_NOTE }, async t => {
   const f = await fixture(t);
   const original = '[application]\nconfig/name="mine"\n';
   await fs.writeFile(path.join(f.project, 'override.cfg'), original);
   try {
-    const result = await f.controller.session('game', { keepAwake: false });
+    const result = await f.controller.session('game', { keepAwake: false, headless: true });
     assert.equal(result.ok, true);
-    await until(() => f.controller.processes.get(result.session.id).stdout.includes('READY'));
+    await until(() => f.controller.processes.get(result.session.id).stdout.includes('READY'), 60_000);
     const stopped = await f.controller.session('stop', { kind: 'game' });
     assert.equal(stopped.ok, true);
     assert.equal(await fs.readFile(path.join(f.project, 'override.cfg'), 'utf8'), original);
@@ -77,14 +149,14 @@ test('stop by kind waits for injection cleanup and restores user configuration',
   } finally { await f.dispose(); }
 });
 
-test('shared project injection survives until the last game or attach is released', { skip: process.platform === 'win32' }, async t => {
+test('shared project injection survives until the last game or attach is released', { skip: REAL_GODOT_SKIP && REAL_SKIP_NOTE }, async t => {
   const f = await fixture(t);
   const original = '[application]\nconfig/name="shared"\n';
   await fs.writeFile(path.join(f.project, 'override.cfg'), original);
   try {
     const [a, b] = await Promise.all([
-      f.controller.session('game', { keepAwake: false }),
-      f.controller.session('game', { keepAwake: false }),
+      f.controller.session('game', { keepAwake: false, headless: true }),
+      f.controller.session('game', { keepAwake: false, headless: true }),
     ]);
     assert.equal(a.ok && b.ok, true);
     const attached = await f.controller.session('attach', {});
@@ -184,37 +256,98 @@ test('queued tools stay serial and a cancelled queued write never executes', asy
   } finally { release(); tr.input.end(); await tr.finished; }
 });
 
-for (const target of ['editor', 'runtime']) {
-  test(`${target} bridge cancellation closes an outstanding socket promptly`, async () => {
-    let socket;
-    let received = false;
-    const server = net.createServer(peer => {
-      socket = peer;
-      peer.on('data', data => {
-        if (target === 'editor' && data.toString().startsWith('GET ')) {
-          peer.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
-        } else received = true;
-      });
+test('editor bridge cancellation closes an outstanding socket promptly', async () => {
+  let socket;
+  let received = false;
+  const server = net.createServer(peer => {
+    socket = peer;
+    peer.on('data', data => {
+      if (data.toString().startsWith('GET ')) {
+        peer.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+      } else received = true;
     });
-    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const abort = new AbortController();
-    let result;
-    const pending = new GodotController().bridge(target, target === 'editor' ? 'editor.execute' : 'rt.eval', {}, {
-      port: server.address().port, signal: abort.signal, timeoutMs: 3000,
-    }).then(value => { result = value; });
-    try {
-      await until(() => received);
-      abort.abort();
-      await until(() => result !== undefined);
-      assert.equal(result.code, 'ABORTED');
-      assert.equal(result.ok, false);
-    } finally {
-      socket?.destroy();
-      await pending;
-      await new Promise(resolve => server.close(resolve));
-    }
   });
-}
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const abort = new AbortController();
+  let result;
+  const pending = new GodotController().bridge('editor', 'editor.execute', {}, {
+    port: server.address().port, signal: abort.signal, timeoutMs: 3000,
+  }).then(value => { result = value; });
+  try {
+    await until(() => received);
+    abort.abort();
+    await until(() => result !== undefined, 15_000);
+    assert.equal(result.code, 'ABORTED');
+    assert.equal(result.ok, false);
+  } finally {
+    socket?.destroy();
+    await pending;
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('runtime bridge cancellation closes an outstanding socket promptly', async () => {
+  // 运行时的取消路径现在包含「同连接身份校验」：先应答 rt.ping，再对真正的 op 保持沉默，
+  // 这样才是在验证「挂住的 op 被取消后立刻断开」，而不是在校验阶段就失败。
+  let socket;
+  let received = false;
+  let projectPath;
+  const server = net.createServer(peer => {
+    socket = peer;
+    let buffer = '';
+    peer.on('data', data => {
+      buffer += String(data);
+      let index;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        if (!line.trim()) continue;
+        let message;
+        try { message = JSON.parse(line); } catch { continue; }
+        if (message.op === 'rt.ping') {
+          peer.write(`${JSON.stringify({
+            id: message.id,
+            ok: true,
+            data: {
+              pong: true,
+              nonce: message.params.nonce,
+              port: server.address().port,
+              protocol: 'godot-mcp-runtime/1',
+              project: projectPath,
+              pid: process.pid,
+            },
+          })}\n`);
+        } else {
+          received = true; // 真正的 op：不回，制造「挂住」
+        }
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const fixture = await fs.mkdtemp(path.join(os.tmpdir(), 'gmcp-bridge-cancel-'));
+  projectPath = fixture;
+  const abort = new AbortController();
+  let result;
+  const pending = new GodotController().bridge('runtime', 'rt.eval', {}, {
+    port: server.address().port,
+    project: fixture,
+    readyTimeoutMs: 3000,
+    signal: abort.signal,
+    timeoutMs: 3000,
+  }).then(value => { result = value; });
+  try {
+    await until(() => received, 15_000);
+    abort.abort();
+    await until(() => result !== undefined, 15_000);
+    assert.equal(result.code, 'ABORTED');
+    assert.equal(result.ok, false);
+  } finally {
+    socket?.destroy();
+    await pending;
+    await new Promise(resolve => server.close(resolve));
+    await fs.rm(fixture, { recursive: true, force: true });
+  }
+});
 
 test('EOF aborts pending tools before shutting down the controller', async () => {
   let entered = false;

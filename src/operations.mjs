@@ -7,7 +7,15 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import fsp from 'node:fs/promises';
-import { PACKAGE_ROOT, RESULT_MARKER, extractResult, godotPath, resolveProject, runProcess } from './godot.mjs';
+import {
+  PACKAGE_ROOT,
+  RESULT_MARKER,
+  engineHelperEnv,
+  extractResult,
+  godotPath,
+  resolveProject,
+  runProcess,
+} from './godot.mjs';
 
 /** ops.gd 是本层唯一入口；放在包内 godot/ 目录。 */
 export const OPS_SCRIPT = path.join(PACKAGE_ROOT, 'godot', 'ops.gd');
@@ -127,13 +135,19 @@ async function runOperationOnce(op, params = {}, options = {}) {
       cwd: projectPath ?? options.cwd,
       timeoutMs,
       signal: options.signal,
+      // ops.gd 的嵌套 op（导入/导出/run_project/deep parse_check）要自己起 Node helper。
+      // 显式传递当前 Node 和 helper 的绝对路径，避免嵌套执行依赖 PATH 搜索。
+      env: engineHelperEnv(),
     });
   } catch (error) {
+    // 进程树回收结果要如实带出去：调用方需要知道「杀干净了没有」，
+    // 而不是只知道「超时/取消了」。kill.ok=false 或 survivors 非空意味着可能有残留。
+    const killDetail = error?.kill ? { kill: error.kill } : undefined;
     if (error?.code === 'TIMEOUT') {
-      throw new GodotOperationError(`op ${op} 超时（${timeoutMs}ms）`, { op, code: 'TIMEOUT', details: String(error.message) });
+      throw new GodotOperationError(`op ${op} 超时（${timeoutMs}ms）`, { op, code: 'TIMEOUT', details: { message: String(error.message), ...killDetail } });
     }
     if (error?.code === 'ABORTED') {
-      throw new GodotOperationError(`op ${op} 已取消`, { op, code: 'ABORTED' });
+      throw new GodotOperationError(`op ${op} 已取消`, { op, code: 'ABORTED', details: killDetail });
     }
     throw new GodotOperationError(`启动 Godot 失败：${String(error?.message ?? error)}`, { op, code: 'SPAWN_FAILED' });
   }

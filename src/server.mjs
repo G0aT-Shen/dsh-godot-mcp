@@ -14,8 +14,8 @@ import process from 'node:process';
 import { buildStatus } from './build.mjs';
 import { DEFAULT_EDITOR_PORT, DEFAULT_RUNTIME_PORT, godotStatus, resolveProject } from './godot.mjs';
 import { GodotOperationError, OPS_SCRIPT, runOperation, selfCheck } from './operations.mjs';
-import { ProcessRegistry } from './processes.mjs';
-import { callBridge, probePort } from './bridge.mjs';
+import { ProcessRegistry, trustedEnginePid } from './processes.mjs';
+import { callBridge, callRuntimeVerified, probePort, projectComparisonKey, sameProjectPath, waitForRuntime } from './bridge.mjs';
 import { installBridge } from './install.mjs';
 import { pendingInjections } from './inject.mjs';
 
@@ -107,6 +107,123 @@ export class GodotController {
       godot: this.config.godotPath,
       defaultProject: this.config.defaultProject,
       cwd: this.config.cwd,
+      // runtimePort 必须贯穿到 startGame/attach：自定义端口会写进 port.cfg，
+      // 运行时脚本读它决定监听哪个端口（否则「同机多项目」必然互撞）。
+      runtimePort: this.runtimePort,
+    };
+  }
+
+  /**
+   * 猜「我要连的运行时桥属于哪个项目」。
+   *
+   * 只有一个候选（唯一在跑的游戏 / 唯一 attach）时才敢自动判定；多个候选时**不猜** ——
+   * 猜错就会把命令发进另一个项目的游戏里，比连不上危险得多。调用方可以用 project 显式指定。
+   */
+  /**
+   * 解析「这次运行时调用到底针对哪个项目/哪个进程」。
+   *
+   * 顺序：显式 project → 唯一在跑的游戏会话 → 唯一 attach → config.defaultProject →
+   *      cwd 向上找 project.godot。
+   *
+   * 选 pid 的规则（都是踩过的坑）：
+   *   · **按端口选会话**：同一项目可能同时开着多个会话（各自不同 runtimePort），
+   *     不能拿「第一个会话」当目标 —— 那会把命令发进另一个端口上的游戏；
+   *   · **只认可信的引擎 pid**：macOS 上 keepAwake 会用 caffeinate 包住 Godot，
+   *     此时 `child.pid` 是 caffeinate 的 pid。解析不到真实引擎 pid 时**不传 pid**
+   *     （宁可只校验项目，也不用假 pid 触发 PID_MISMATCH 误报）；Windows 没有 wrapper，
+   *     `child.pid` 就是引擎本身，PID 校验是严格的；
+   *   · 多候选无法判定时返回 AMBIGUOUS_PROJECT，绝不猜。
+   *
+   * @param {{project?: string}} options
+   * @param {number} [port] 本次要连的运行时端口（默认取 controller 配置）
+   */
+  async resolveRuntimeTarget(options = {}, port) {
+    const wantedPort = port ?? this.runtimePort;
+    const identityOptions = this.config.identityOptions ?? {};
+    const running = this.processes.findRunning('game');
+    const enginePidOf = session => trustedEnginePid(session);
+    const sessionDescriptor = session => ({
+      pid: enginePidOf(session),
+      pidSource: session?.pidSource ?? 'none',
+      pidVerified: enginePidOf(session) !== undefined,
+    });
+    const pickByPort = (sessions, project, source) => {
+      const byPort = sessions.filter(session => session.runtimePort === wantedPort);
+      if (byPort.length === 1) return { project, source, ...sessionDescriptor(byPort[0]) };
+      if (byPort.length > 1) {
+        return {
+          error: {
+            code: 'AMBIGUOUS_PROJECT',
+            message: `项目 ${project} 有多个会话都在用运行时端口 ${wantedPort}，无法判定目标进程；请只保留一个或显式指定端口。`,
+          },
+        };
+      }
+      // 没有任何会话在用这个端口：只按项目校验，不拿别的会话的 pid 顶替
+      return { project, source: `${source}+port-unmatched`, pid: undefined, pidSource: 'port-unmatched', pidVerified: false };
+    };
+
+    if (options.project) {
+      // 用**规范化的项目身份**匹配，而不是字符串相等：Windows 的斜杠/盘符大小写、
+      // junction/symlink 别名都会让字符串比较失败，从而丢掉 knownPID（PID 级校验退化）。
+      const sameProject = running.filter(session => sameProjectPath(session.projectPath, options.project, identityOptions));
+      if (sameProject.length === 0) {
+        return { project: options.project, source: 'explicit', pid: undefined, pidSource: 'no-session', pidVerified: false };
+      }
+      return pickByPort(sameProject, options.project, 'explicit+managed-session');
+    }
+
+    // 先按「比较键」归并：同一个项目的不同别名（斜杠/大小写/junction）不能被当成两个项目
+    const byKey = new Map();
+    for (const session of running) {
+      const key = projectComparisonKey(session.projectPath, identityOptions) ?? session.projectPath;
+      if (key && !byKey.has(key)) byKey.set(key, session.projectPath);
+    }
+    const projects = [...byKey.values()].filter(Boolean);
+    if (projects.length > 1) {
+      return {
+        error: {
+          code: 'AMBIGUOUS_PROJECT',
+          message: `当前有多个游戏会话（${projects.join(', ')}），无法判断这个端口属于谁；请用 project 参数显式指定目标项目。`,
+        },
+      };
+    }
+    if (projects.length === 1) {
+      const sameProject = running.filter(session => sameProjectPath(session.projectPath, projects[0], identityOptions));
+      return pickByPort(sameProject.length ? sameProject : running, projects[0], 'managed-session');
+    }
+
+    const attachedByKey = new Map();
+    for (const entry of this.processes.list()) {
+      if (!entry.attached || !entry.projectPath) continue;
+      const key = projectComparisonKey(entry.projectPath, identityOptions) ?? entry.projectPath;
+      if (!attachedByKey.has(key)) attachedByKey.set(key, entry.projectPath);
+    }
+    const attachedProjects = [...attachedByKey.values()];
+    if (attachedProjects.length === 1) {
+      return { project: attachedProjects[0], source: 'attached', pid: undefined, pidSource: 'attached', pidVerified: false };
+    }
+    if (attachedProjects.length > 1) {
+      return {
+        error: {
+          code: 'AMBIGUOUS_PROJECT',
+          message: `当前有多个 attach 记录（${attachedProjects.join(', ')}），请用 project 参数显式指定目标项目。`,
+        },
+      };
+    }
+    if (this.config.defaultProject) {
+      return { project: this.config.defaultProject, source: 'default-project', pid: undefined, pidSource: 'no-session', pidVerified: false };
+    }
+    try {
+      const fromCwd = await findProjectRoot(this.config.cwd ?? process.cwd());
+      if (fromCwd) return { project: fromCwd, source: 'cwd', pid: undefined, pidSource: 'no-session', pidVerified: false };
+    } catch { /* cwd 不可用 */ }
+    return {
+      error: {
+        code: 'PROJECT_UNSPECIFIED',
+        message:
+          '没有可校验的目标项目：既没有本 server 管理的游戏会话/attach 记录，显式 project、config.defaultProject 与 cwd 也都没解析出项目。' +
+          '为避免把命令发进未知进程，这里拒绝执行；请传 project 参数，或先用 godot_session 启动/attach。',
+      },
     };
   }
 
@@ -179,13 +296,75 @@ export class GodotController {
       const port =
         options.port ??
         (target === 'editor' ? this.editorPort : this.runtimePort);
-      const data = await callBridge(target, op, params, {
-        port,
+      if (target !== 'runtime') {
+        const data = await callBridge(target, op, params, {
+          port,
+          host: options.host,
+          timeoutMs: options.timeoutMs,
+          signal: options.signal,
+        });
+        return { ok: true, target, op, data };
+      }
+
+      // ---- 运行时桥：先定目标，再在同一条连接上「校验 + 执行」 ----
+      const resolvedTarget = await this.resolveRuntimeTarget(options, port);
+      const readyTimeoutMs = options.readyTimeoutMs ?? 15_000;
+      if (resolvedTarget.error) {
+        // 纯探测（rt.ping）且调用方没有指定目标：允许执行，但**明确标注未校验**，
+        // 绝不冒充「已验证归属」。
+        if (op === 'rt.ping' && !options.project) {
+          const data = await callBridge('runtime', op, params, { port, host: options.host, timeoutMs: options.timeoutMs, signal: options.signal });
+          return { ok: true, target, op, data, ownership: { verified: false, reason: resolvedTarget.error.code } };
+        }
+        const error = new Error(resolvedTarget.error.message);
+        error.code = resolvedTarget.error.code;
+        throw error;
+      }
+
+      const expectedProject = resolvedTarget.project;
+      // 允许调用方显式钉定 pid（例如「我就是要连我启动的那个实例」）；
+      // 没给就用本 server 管理的会话 pid。两者都会在**同一条连接**上被严格校验。
+      const expectedPid = options.expectedPid ?? resolvedTarget.pid;
+      // readyTimeoutMs=0 只表示「不要等就绪」，**不表示可以跳过校验**：
+      // 只要目标是明确的（显式 project / 已知 pid），就给一次很短的校验机会。
+      const mustVerify = Boolean(options.project) || expectedPid !== undefined || resolvedTarget.source !== 'cwd';
+      const verifyTimeoutMs = readyTimeoutMs > 0 ? readyTimeoutMs : (mustVerify ? 3000 : 0);
+      let ownership;
+      if (verifyTimeoutMs > 0) {
+        const ready = await waitForRuntime({
+          host: options.host,
+          port,
+          project: expectedProject,
+          pid: expectedPid,
+          timeoutMs: verifyTimeoutMs,
+          signal: options.signal,
+        });
+        if (!ready.ok) {
+          const error = new Error(ready.error);
+          error.code = ready.code;
+          error.expectedProject = ready.expectedProject;
+          error.remoteProject = ready.project;
+          throw error;
+        }
+        ownership = ready.ownership;
+      }
+
+      // 真正执行 op：在**同一条连接**上先 rt.ping 校验身份再发 op（关掉 TOCTOU 窗口）。
+      const verified = await callRuntimeVerified(op, params, {
         host: options.host,
+        port,
         timeoutMs: options.timeoutMs,
         signal: options.signal,
+        expectedProject,
+        expectedPid,
       });
-      return { ok: true, target, op, data };
+      return {
+        ok: true,
+        target,
+        op,
+        data: verified.data,
+        ownership: { ...verified.ownership, source: resolvedTarget.source },
+      };
     } catch (error) {
       return failure(error, { target, op });
     }
@@ -221,11 +400,42 @@ export class GodotController {
         }
         case 'game': {
           const process_ = await this.processes.startGame(options);
-          if (params.signal?.aborted) {
-            await this.processes.stop(process_.id);
-            params.signal.throwIfAborted();
+          const runtimePort = params.runtimePort ?? this.runtimePort;
+          try {
+            // 取消检查放进 try：**等待就绪期间**被取消也必须在这里收尾，
+            // 不能只在 startGame 之后查一次（旧实现的窗口：await 期间 abort → 会话泄漏）。
+            params.signal?.throwIfAborted();
+            const payload = {
+              ok: true,
+              session: cleanJson(process_.toJSON()),
+              runtimePort,
+            };
+            // 只有「可信的引擎 pid」才拿去做严格校验：macOS 的 keepAwake 会用 caffeinate 包住
+            // Godot，此时 child.pid 是 wrapper 的 pid，传下去必然误报 PID_MISMATCH。
+            const trustedPid = trustedEnginePid(process_);
+            payload.pidSource = process_.pidSource;
+            if (params.readyTimeoutMs > 0) {
+              const ready = await waitForRuntime({
+                port: runtimePort,
+                project: process_.projectPath,
+                pid: trustedPid,
+                timeoutMs: params.readyTimeoutMs,
+                signal: params.signal,
+              });
+              payload.ready = cleanJson({
+                ...ready,
+                pidVerified: trustedPid !== undefined,
+                ...(trustedPid === undefined
+                  ? { pidNote: 'wrapper（caffeinate）下没有解析到真实引擎 pid：本次只校验了项目归属，PID 级校验已跳过（macOS 保证降低）' }
+                  : {}),
+              });
+            }
+            return payload;
+          } catch (error) {
+            // 就绪等待失败/被取消：把刚起的会话停掉并清理注入，再如实抛出
+            await this.processes.stop(process_.id).catch(() => {});
+            throw error;
           }
-          return { ok: true, session: cleanJson(process_.toJSON()) };
         }
         case 'attach': {
           // 游戏不是我们启动的（CI / 手动 godot --path . / 外部调试器），
@@ -389,6 +599,18 @@ export function buildToolDefinitions(controller) {
           limit: { type: 'integer', description: '日志最多返回字节数' },
           editor: { type: 'boolean', description: 'setup 时是否安装编辑器桥，默认 true' },
           runtime: { type: 'boolean', description: 'setup 时是否安装运行时桥，默认 true' },
+          runtimePort: {
+            type: 'integer',
+            description:
+              '运行时桥端口（默认 9091）。自定义端口会写进项目的 .godot/mcp_bridge/port.cfg，' +
+              '运行时脚本启动时读取它 —— 同机多项目必须给每个游戏不同端口',
+          },
+          readyTimeoutMs: {
+            type: 'integer',
+            description:
+              'game 时等待运行时桥就绪的毫秒数（默认 0=不等待）。>0 时返回 ready 块，' +
+              '包含就绪状态与项目归属校验结果（PROJECT_MISMATCH / PORT_OCCUPIED / RUNTIME_NOT_READY）',
+          },
           bridge: {
             type: 'string',
             enum: ['auto', 'transient', 'installed', 'none'],
@@ -420,6 +642,22 @@ export function buildToolDefinitions(controller) {
           op: { type: 'string', description: '桥操作名（editor.* 或 rt.*）' },
           params: { type: 'object', description: '操作参数', additionalProperties: true },
           port: { type: 'integer', description: '覆盖默认端口（editor 9089 / runtime 9091）' },
+          project: {
+            type: 'string',
+            description:
+              'runtime 目标：期望的项目目录，用于校验端口后面的游戏是不是它（防止连到另一个项目的游戏上）',
+          },
+          expectedPid: {
+            type: 'integer',
+            description:
+              'runtime 目标：期望的进程 pid。给了就要求端口后面的游戏 pid 与之完全一致（防止连到同机另一个实例）',
+          },
+          readyTimeoutMs: {
+            type: 'integer',
+            description:
+              'runtime 目标：等待桥就绪的毫秒数（默认 15000）。期间会重试连接并校验协议与项目归属；' +
+              '传 0 关闭等待，直接连一次',
+          },
           timeoutMs: {
             type: 'integer',
             description:
@@ -432,6 +670,9 @@ export function buildToolDefinitions(controller) {
       },
       handler: async (args, exec) => controller.bridge(args.target, args.op, args.params ?? {}, {
         port: args.port,
+        project: args.project,
+        expectedPid: args.expectedPid,
+        readyTimeoutMs: args.readyTimeoutMs,
         timeoutMs: args.timeoutMs,
         signal: exec?.signal,
       }),

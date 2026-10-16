@@ -205,6 +205,10 @@ export async function injectTransientBridge(projectPath, options = {}) {
     backupPath: path.join(projectPath, OVERRIDE_BACKUP_NAME),
     scriptDir: path.join(projectPath, TRANSIENT_DIR_RELATIVE),
     hadOwnOverride: state.backupExists || (state.overrideExists && !state.overrideHasAutoload),
+    // 记录**是谁注入的**：回收时只允许「注入者已经不在」的条目，见 sweepStaleInjections。
+    // override.cfg 是项目级（global）配置：另一个还活着的 server / 还跑着的游戏
+    // 可能正靠它工作，贸然还原会把人家正在跑的东西弄坏。
+    owner: { pid: process.pid, host: os.hostname(), at: new Date().toISOString() },
   });
 
   return {
@@ -245,14 +249,57 @@ export async function restoreTransientBridge(projectPath) {
 }
 
 /**
- * 回收「状态文件里记着、但已经没有活跃会话」的注入。
- * 场景：MCP 进程被 kill，游戏进程随之消失，override.cfg 留在项目里。
+ * 判断某个 pid 是否还活着（用于 owner-aware 回收）。
+ * EPERM 说明进程存在但没有权限发信号 —— 也算活着。
+ * @param {number} pid
  */
-export async function sweepStaleInjections({ isActive = () => false } = {}) {
+export function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+/**
+ * 回收「状态文件里记着、但已经没有活跃会话」的注入。
+ *
+ * 场景：MCP 进程被 kill（游戏随之消失），override.cfg 留在项目里。
+ *
+ * **这不是自动启动清理**：没有任何「server 一起来就扫一遍」的隐式行为。
+ * 只有显式调用（godot_session(action="cleanup")）或本函数被显式调用时才会执行，
+ * 因为 override.cfg 是**项目级**配置，误还原会破坏别人正在跑的东西。
+ *
+ * 三条安全线（缺一不可）：
+ *   1. 记录里的 owner pid 还活着 → 跳过（那是另一个 server 的注入，不是残留）；
+ *   2. 该项目仍有活跃会话（游戏/attach）→ 跳过；
+ *   3. 否则还原，并把「跳过原因」如实带出去。
+ *
+ * @param {{isActive?: (project: string) => boolean, ownerAlive?: (pid: number) => boolean}} [options]
+ */
+export async function sweepStaleInjections({ isActive = () => false, ownerAlive = pidAlive, onSkip } = {}) {
   const pending = await pendingInjections();
   const swept = [];
   for (const entry of pending) {
-    if (isActive(entry.project)) continue;
+    // 返回值只包含「真的清理了」的条目（保持原有契约）；跳过原因通过 onSkip 汇报，
+    // 调用方（例如 godot_session cleanup 的 JSON 输出）可以把它带给用户。
+    if (isActive(entry.project)) {
+      onSkip?.({ project: entry.project, cleaned: false, skipped: 'project-active', note: '该项目仍有活跃会话，不还原' });
+      continue;
+    }
+    const owner = entry.owner;
+    if (owner?.pid && owner.pid !== process.pid && ownerAlive(owner.pid)) {
+      onSkip?.({
+        project: entry.project,
+        cleaned: false,
+        skipped: 'owner-alive',
+        owner,
+        note: `注入者进程 ${owner.pid} 还活着（可能是另一个 server），不做还原以免破坏它正在用的注入`,
+      });
+      continue;
+    }
     const state = await transientState(entry.project);
     if (!state.backupExists && !state.overrideHasAutoload && !state.scriptExists) {
       await forgetProject(entry.project);

@@ -50,14 +50,14 @@ const REALISTIC = `- id: ui-chat
       - /repos/dsh-codex-bridge
 `;
 
-/** 可选：本机 DSH profile 里通常带着真正的 YAML 解析器，用它做交叉验证。 */
+/** 真实 YAML 解析器：仓库 devDependency 优先，其次本机 DSH profile。 */
 function loadYaml() {
-  try {
-    const require_ = createRequire(path.join(os.homedir(), '.dsh', 'profiles', 'desktop', 'package.json'));
-    return require_('yaml');
-  } catch {
-    return undefined;
+  for (const base of [path.join(process.cwd(), 'package.json'), path.join(os.homedir(), '.dsh', 'profiles', 'desktop', 'package.json')]) {
+    try {
+      return createRequire(base)('yaml');
+    } catch { /* 试下一个来源 */ }
   }
+  return undefined;
 }
 
 test('条目块的结构与关键字段齐全', () => {
@@ -75,7 +75,7 @@ test('条目块的结构与关键字段齐全', () => {
     godotPath: '/Applications/Godot.app/Contents/MacOS/Godot',
   });
   assert.match(pinned, /^ {8}env:$/m);
-  assert.match(pinned, /^ {10}GODOT_MCP_GODOT: \/Applications\/Godot\.app\/Contents\/MacOS\/Godot$/m);
+  assert.match(pinned, /^ {10}GODOT_MCP_GODOT: "\/Applications\/Godot\.app\/Contents\/MacOS\/Godot"$/m);
 });
 
 test('把条目插进已有的 insert 子数组，且不碰别人任何一行', () => {
@@ -151,6 +151,7 @@ test('结构自检能抓出缩进错与缺字段（防止把坏 YAML 写进别�
 test('本机有真实 YAML 解析器时，交叉验证生成结果是合法 YAML 且条目可读', async t => {
   const YAML = loadYaml();
   if (!YAML) {
+    assert.notEqual(process.env.GODOT_MCP_REQUIRE_YAML, '1', '要求真实 YAML 解析器（GODOT_MCP_REQUIRE_YAML=1）但一个都找不到');
     t.diagnostic('本机没有可用的 yaml 包，跳过交叉验证（结构自检仍已覆盖）');
     return;
   }

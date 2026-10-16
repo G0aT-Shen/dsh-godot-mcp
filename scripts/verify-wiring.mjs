@@ -22,6 +22,8 @@ import process from 'node:process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { probeMcpServer } from './lib/probe-mcp.mjs';
+
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 import { ENTRY_ID, parseEntryLoose, validatePatchText } from './lib/profile-patch.mjs';
 
 const CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
@@ -71,12 +73,16 @@ async function main() {
   // 1. 优先用真实 YAML 解析器（正则看不出缩进/引号这类会让 DSH 加载失败的问题）；
   //    没有的话退回结构自检（同一个模块在单测里被覆盖）。
   const { createRequire } = await import('node:module');
-  const require_ = createRequire(path.join(profileDir, 'package.json'));
   let YAML;
-  try {
-    YAML = require_('yaml');
-  } catch {
-    info('profile 里找不到 yaml 包，改用结构自检（缩进/字段仍然会查）');
+  // 仓库自己的 devDependency 优先（CI 里 npm install 之后一定有），其次才是 profile 的 node_modules。
+  for (const base of [path.join(PACKAGE_ROOT, 'package.json'), path.join(profileDir, 'package.json')]) {
+    try {
+      YAML = createRequire(base)('yaml');
+      break;
+    } catch { /* 试下一个来源 */ }
+  }
+  if (!YAML) {
+    info('本机与 profile 都找不到 yaml 包，改用结构自检（缩进/字段仍然会查）');
   }
 
   let doc;

@@ -1,0 +1,163 @@
+name: Windows MCP
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-mcp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows / Node ${{ matrix.node }}
+    runs-on: windows-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    env:
+      GODOT_VERSION: 4.7.2-stable
+      GODOT_TEMPLATE_VERSION: 4.7.2.stable
+      GODOT_MCP_REQUIRE_YAML: '1'
+      GODOT_MCP_REQUIRE_GODOT: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache official engine and Windows export templates
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/godot-ci
+          key: godot-windows-x64-4.7.2-v2
+
+      - name: Download official Godot assets
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          $cacheDir = Join-Path $env:RUNNER_TEMP 'godot-ci'
+          $engineDir = Join-Path $cacheDir 'Godot 引擎 #1'
+          $templateDir = Join-Path $cacheDir 'templates'
+          New-Item -ItemType Directory -Force -Path $engineDir, $templateDir | Out-Null
+          $release = "https://github.com/godotengine/godot/releases/download/$env:GODOT_VERSION"
+          $engineZip = Join-Path $cacheDir 'godot-engine.zip'
+          Invoke-WebRequest "$release/Godot_v$($env:GODOT_VERSION)_win64.exe.zip" -OutFile $engineZip
+          Expand-Archive -LiteralPath $engineZip -DestinationPath $engineDir -Force
+          $templateZip = Join-Path $env:RUNNER_TEMP 'godot-templates.zip'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'godot-templates-unpacked'
+          Invoke-WebRequest "$release/Godot_v$($env:GODOT_VERSION)_export_templates.tpz" -OutFile $templateZip
+          Expand-Archive -LiteralPath $templateZip -DestinationPath $unpacked -Force
+          $source = Join-Path $unpacked 'templates'
+          foreach ($name in @('version.txt', 'windows_debug_x86_64.exe', 'windows_release_x86_64.exe', 'windows_debug_x86_64_console.exe', 'windows_release_x86_64_console.exe')) {
+            Copy-Item -LiteralPath (Join-Path $source $name) -Destination $templateDir
+          }
+          Remove-Item -LiteralPath $unpacked -Recurse -Force
+          Remove-Item -LiteralPath $templateZip -Force
+
+      - name: Configure native engine and templates
+        run: |
+          $cacheDir = Join-Path $env:RUNNER_TEMP 'godot-ci'
+          $engineDir = Join-Path $cacheDir 'Godot 引擎 #1'
+          $engine = @(Get-ChildItem -LiteralPath $engineDir -Filter '*_win64.exe' -File)
+          if ($engine.Count -ne 1) { throw "Expected one native Godot executable, found $($engine.Count)" }
+          "GODOT_MCP_GODOT=$($engine[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GODOT_MCP_ENGINE_ZIP=$(Join-Path $cacheDir 'godot-engine.zip')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $target = Join-Path $env:APPDATA "Godot/export_templates/$env:GODOT_TEMPLATE_VERSION"
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Get-ChildItem -LiteralPath (Join-Path $cacheDir 'templates') -File | Copy-Item -Destination $target
+          New-Item -ItemType Directory -Force -Path 'verification/ci-logs' | Out-Null
+
+      - name: Install test dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify engine version
+        run: node -e "const c=require('node:child_process');const v=c.execFileSync(process.env.GODOT_MCP_GODOT,['--headless','--version'],{encoding:'utf8'}).trim();console.log(v);if(!v.startsWith('4.7.2.'))process.exit(1)"
+
+      - name: Verify native offline installer helpers
+        run: |
+          $script = @'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import os from 'node:os';
+          import { execFileSync } from 'node:child_process';
+          import { assertZipFile, unpackZip, locateGodotBinary } from './scripts/lib/godot-install.mjs';
+          const destination = fs.mkdtempSync(path.join(os.tmpdir(), 'Windows 解包 #1-'));
+          try {
+            assertZipFile(process.env.GODOT_MCP_ENGINE_ZIP);
+            const unpacked = unpackZip(process.env.GODOT_MCP_ENGINE_ZIP, destination);
+            assert.ok(unpacked.command, JSON.stringify(unpacked.failures));
+            const binary = locateGodotBinary(destination, {version: process.env.GODOT_VERSION});
+            assert.ok(binary?.endsWith('_win64.exe'), String(binary));
+            const version = execFileSync(binary, ['--headless', '--version'], {encoding: 'utf8'}).trim();
+            assert.match(version, /^4\.7\.2\./);
+            console.log(JSON.stringify({unpacker: unpacked.command, binary, version}));
+          } finally { fs.rmSync(destination, {recursive: true, force: true}); }
+          '@
+          $script | node --input-type=module 2>&1 | Tee-Object -FilePath verification/ci-logs/installer.log
+          if ($LASTEXITCODE -ne 0) { throw 'Native installer verification failed' }
+
+      - name: Install and verify an isolated DSH profile
+        run: |
+          $profileDir = Join-Path $env:RUNNER_TEMP 'DSH 配置 #1'
+          New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+          '{}' | Set-Content -LiteralPath (Join-Path $profileDir 'package.json') -Encoding utf8NoBOM
+          '[]' | Set-Content -LiteralPath (Join-Path $profileDir 'cordis.patch.yml') -Encoding utf8NoBOM
+          node scripts/setup.mjs --profile $profileDir 2>&1 | Tee-Object -FilePath verification/ci-logs/setup.log
+          if ($LASTEXITCODE -ne 0) { throw 'Initial setup failed' }
+          $patchPath = Join-Path $profileDir 'cordis.patch.yml'
+          $before = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash
+          node scripts/setup.mjs --profile $profileDir 2>&1 | Tee-Object -FilePath verification/ci-logs/setup-repeat.log
+          if ($LASTEXITCODE -ne 0) { throw 'Repeated setup failed' }
+          if ((Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash -ne $before) { throw 'Setup is not idempotent' }
+          node scripts/verify-wiring.mjs $profileDir 2>&1 | Tee-Object -FilePath verification/ci-logs/wiring.log
+          if ($LASTEXITCODE -ne 0) { throw 'Profile wiring failed' }
+
+      - name: Unit and native process lifecycle tests
+        run: |
+          npm test 2>&1 | Tee-Object -FilePath verification/ci-logs/unit.log
+          if ($LASTEXITCODE -ne 0) { throw 'Unit/lifecycle tests failed' }
+
+      - name: MCP protocol integration
+        run: |
+          node scripts/verify-mcp.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/mcp.log
+          if ($LASTEXITCODE -ne 0) { throw 'MCP integration failed' }
+
+      - name: Godot operations integration
+        run: |
+          node scripts/verify-e2e.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/operations.log
+          if ($LASTEXITCODE -ne 0) { throw 'Godot operations failed' }
+
+      - name: Diagnostics and deep parse checks
+        run: |
+          node scripts/verify-diagnostics.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/diagnostics.log
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostics integration failed' }
+
+      - name: Runtime bridge and cleanup integration
+        run: |
+          node scripts/verify-l3.mjs --headless 2>&1 | Tee-Object -FilePath verification/ci-logs/runtime.log
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime integration failed' }
+
+      - name: Windows export and release bridge gate
+        run: |
+          node scripts/verify-export.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/export.log
+          if ($LASTEXITCODE -ne 0) { throw 'Export gate failed' }
+
+      - name: Upload verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-node-${{ matrix.node }}-verification
+          path: verification/ci-logs/
+          if-no-files-found: ignore
+          retention-days: 14

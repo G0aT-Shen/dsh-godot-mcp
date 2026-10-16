@@ -12,29 +12,61 @@
 //      失焦后会进 App Nap / 系统空闲休眠，定时器整段停摆 —— 进程还活着、端口还在
 //      听，但脚本一步都不往前走，表现为「工具调用莫名其妙超时」。
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { godotPath, resolveProject } from './godot.mjs';
-import { hasInstalledBridge, injectTransientBridge, restoreTransientBridge, pendingInjections } from './inject.mjs';
+import { DEFAULT_RUNTIME_PORT, godotPath, resolveProject } from './godot.mjs';
+import { terminateTree } from './proc-tree.mjs';
+import {
+  hasInstalledBridge,
+  injectTransientBridge,
+  restoreTransientBridge,
+  pendingInjections,
+  pidAlive,
+} from './inject.mjs';
 
 /** 防止长驻会话被系统休眠/节流冻结；不存在就安静降级。 */
 const CAFFEINATE = '/usr/bin/caffeinate';
 
 /**
+ * 决定要不要用 caffeinate 包住长驻会话。
+ *
+ * 注意它带来一个身份问题：包住之后 `child.pid` 是 **caffeinate 的 pid**，不是 Godot 的。
+ * 所以调用方必须区分「直接子进程 pid」与「真实引擎 pid」（见 ManagedProcess.pidSource）。
+ * Windows 上没有 caffeinate（也没有等价 wrapper），`child.pid` 就是 Godot 本身，
+ * PID 校验必须是严格的。
+ *
+ * @param {string} binary
+ * @param {string[]} args
+ * @param {boolean} enabled
+ * @param {NodeJS.Platform} [platform]
  * @returns {{command: string, args: string[], keepAwake: boolean}}
  */
-function keepAwakeCommand(binary, args, enabled) {
+export function keepAwakeCommand(binary, args, enabled, platform = process.platform) {
   const plain = { command: binary, args, keepAwake: false };
-  if (!enabled || process.platform !== 'darwin' || !existsSync(CAFFEINATE)) return plain;
+  if (!enabled || platform !== 'darwin' || !existsSync(CAFFEINATE)) return plain;
   return { command: CAFFEINATE, args: ['-dimsu', binary, ...args], keepAwake: true };
 }
 
 /** 单个受管进程。 */
 class ManagedProcess extends EventEmitter {
-  constructor({ id, kind, command, args, cwd, projectPath, keepAwake = false }) {
+  constructor({ id, kind, command, args, cwd, projectPath, keepAwake = false, env, runtimePort }) {
     super();
+    /** 这次会话期望的运行时端口（用于「同一个项目多会话」时按端口选目标）。 */
+    this.runtimePort = runtimePort;
+    /**
+     * pid 语义：
+     *   'direct'             —— spawn 出来的进程就是引擎本身（Windows / 未包 wrapper）
+     *   'wrapper-resolved'   —— 被 caffeinate 包住，已解析出真实引擎 pid
+     *   'unresolved-wrapper' —— 被包住但解析失败：**不要**拿 wrapper pid 冒充引擎 pid
+     */
+    this.pidSource = 'direct';
+    this.enginePid = undefined;
+    // 额外环境变量（例如 GODOT_MCP_RUNTIME_PORT）：显式传给被管理的进程。
+    // 运行时端口的**双保险**：port.cfg 给「项目 + 端口」的持久绑定，env 给「这一次启动」，
+    // 少任何一个都会出现「设了自定义端口但仍监听 9091」这类问题。
+    this.env = env;
     this.id = id;
     this.kind = kind; // 'editor' | 'game'
     this.command = command;
@@ -60,7 +92,7 @@ class ManagedProcess extends EventEmitter {
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
       windowsHide: true,
-      env: { ...process.env },
+      env: { ...process.env, ...(this.env ?? {}) },
     });
     const append = (key, chunk) => {
       this[key] += chunk;
@@ -81,49 +113,93 @@ class ManagedProcess extends EventEmitter {
       this.endedAt = Date.now();
       this.emit('exit', { code, signal });
     });
+    if (this.keepAwake) {
+      // wrapper 形态：异步解析真实引擎 pid（失败就保持 undefined，绝不冒充）
+      this.pidSource = 'unresolved-wrapper';
+      void this.#resolveWrappedEnginePid();
+    } else {
+      this.pidSource = 'direct';
+      this.enginePid = this.child.pid;
+    }
     return this;
+  }
+
+  /** caffeinate 的直接子进程就是真正的 Godot；解析不到就如实标 unresolved。 */
+  async #resolveWrappedEnginePid() {
+    const wrapperPid = this.child?.pid;
+    if (wrapperPid === undefined) return;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (this.endedAt !== undefined) return;
+      try {
+        const output = execFileSync('pgrep', ['-P', String(wrapperPid)], { encoding: 'utf8', timeout: 3000 });
+        const pids = output.split('\n').map(Number).filter(Number.isInteger);
+        if (pids.length === 1) {
+          this.enginePid = pids[0];
+          this.pidSource = 'wrapper-resolved';
+          return;
+        }
+        if (pids.length > 1) return; // 多个子进程：无法判定，保持 unresolved
+      } catch { /* pgrep 不可用或还没有子进程 */ }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
 
   get running() {
     return this.child !== undefined && this.endedAt === undefined;
   }
 
-  /** 优雅停止：SIGTERM → 宽限期 → SIGKILL（整个进程组）。 */
+  /** 优雅停止：POSIX 先 SIGTERM 整组 → 宽限 → SIGKILL 整组；Windows 用 taskkill /T → /T /F。 */
   async stop({ graceMs = 5000 } = {}) {
     if (!this.running) return { stopped: false, reason: 'not-running', exitCode: this.exitCode };
     this.stopping = true;
     const pid = this.child.pid;
-    const signalGroup = name => {
-      if (pid === undefined) return;
-      try {
-        if (process.platform === 'win32') this.child.kill(name);
-        else process.kill(-pid, name);
-      } catch {
-        try {
-          this.child.kill(name);
-        } catch {
-          /* 已退出 */
-        }
-      }
-    };
 
     const exited = new Promise(resolve => {
       if (!this.running) resolve(true);
       else this.once('exit', () => resolve(true));
     });
 
-    signalGroup('SIGTERM');
-    const timer = setTimeout(() => signalGroup('SIGKILL'), graceMs);
-    await Promise.race([exited, new Promise(resolve => setTimeout(resolve, graceMs + 2000))]);
-    clearTimeout(timer);
-    if (this.running) signalGroup('SIGKILL');
-    await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 3000))]);
+    let tree;
+    if (process.platform === 'win32' && pid !== undefined) {
+      // 关键：必须在根进程还活着时按 pid 枚举后代。/T 不带 /F 是「尽力优雅」，
+      // headless 控制台进程通常拒绝优雅退出，此时如实记录原因再 /T /F。
+      tree = await terminateTree(pid, { graceMs, isAlive: () => this.running });
+    } else {
+      const signalGroup = name => {
+        if (pid === undefined) return;
+        try {
+          process.kill(-pid, name);
+        } catch {
+          try {
+            this.child.kill(name);
+          } catch {
+            /* 已退出 */
+          }
+        }
+      };
+      signalGroup('SIGTERM');
+      const timer = setTimeout(() => signalGroup('SIGKILL'), graceMs);
+      await Promise.race([exited, new Promise(resolve => setTimeout(resolve, graceMs + 2000))]);
+      clearTimeout(timer);
+      if (this.running) signalGroup('SIGKILL');
+      await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 3000))]);
+    }
 
     return {
       stopped: !this.running,
-      forced: this.running || this.signal === 'SIGKILL',
+      forced: this.running || this.signal === 'SIGKILL' || Boolean(tree?.escalated) || tree?.force === true,
       exitCode: this.exitCode,
       signal: this.signal,
+      ...(tree
+        ? {
+            treeKill: {
+              method: tree.method,
+              ok: tree.ok !== false,
+              escalated: Boolean(tree.escalated),
+              ...(tree.gracefulError ? { gracefulError: tree.gracefulError } : {}),
+            },
+          }
+        : {}),
     };
   }
 
@@ -140,6 +216,10 @@ class ManagedProcess extends EventEmitter {
       exitCode: this.exitCode,
       signal: this.signal,
       keepAwake: this.keepAwake,
+      runtimePort: this.runtimePort,
+      // pid 是 wrapper（caffeinate）还是引擎本身，调用方必须能分辨
+      pidSource: this.pidSource,
+      enginePid: this.enginePid,
       // 桥的形态对调用方是重要信息：installed=项目里提交过桥，transient=这次零足迹注入
       ...(this.bridge ? { bridge: this.bridge } : {}),
       stdoutBytes: this.stdout.length,
@@ -148,6 +228,24 @@ class ManagedProcess extends EventEmitter {
       ...(this.cleanupError ? { cleanupError: this.cleanupError } : {}),
     };
   }
+}
+
+/**
+ * 取「可信的引擎 pid」。
+ *
+ * macOS 上 keepAwake 会用 caffeinate 包住 Godot，此时 `child.pid` 是 **caffeinate 的 pid**，
+ * 拿它去做 PID 校验必然误报 PID_MISMATCH。所以：
+ *   · direct / wrapper-resolved → 返回真实引擎 pid；
+ *   · unresolved-wrapper → 返回 undefined（宁可只校验项目，也不用假 pid 制造误报）。
+ * Windows 没有 wrapper，永远是 direct。
+ *
+ * @param {{pidSource?: string, enginePid?: number, child?: {pid?: number}}} process_
+ * @returns {number|undefined}
+ */
+export function trustedEnginePid(process_) {
+  if (!process_) return undefined;
+  if (process_.pidSource === 'unresolved-wrapper') return undefined;
+  return process_.enginePid ?? process_.child?.pid;
 }
 
 /** 进程注册表。DSH 插件进程内的单例；工具调用之间共享。 */
@@ -238,7 +336,11 @@ export class ProcessRegistry {
       args.push('--path', projectPath);
       if (options.scene) args.push(options.scene);
       args.push(...(options.extraArgs ?? []));
-      const process_ = this.#spawn('game', binary, args, projectPath, options.keepAwake);
+      // 端口双保险之一：env 明确告诉运行时脚本监听哪个端口（另一个是注入写的 port.cfg）
+      const runtimePort = options.runtimePort ?? DEFAULT_RUNTIME_PORT;
+      const process_ = this.#spawn('game', binary, args, projectPath, options.keepAwake, {
+        GODOT_MCP_RUNTIME_PORT: String(runtimePort),
+      }, runtimePort);
       process_.bridge = bridge;
       return process_;
     });
@@ -271,20 +373,41 @@ export class ProcessRegistry {
     });
   }
 
-  /** 回收「记录里还有、但已无活跃会话」的注入（MCP 被杀之后留下的残留）。 */
+  /**
+   * 回收「记录里还有、但已无活跃会话」的注入（MCP 被杀之后留下的残留）。
+   *
+   * 语义边界（重要）：这是**显式**清理（godot_session(action="cleanup")），
+   * 不存在「server 启动时自动扫一遍」的行为。而且：
+   *   · 本项目仍有活跃会话 → 跳过；
+   *   · 记录里的 owner 进程还活着（另一个 server 在用）→ 跳过。
+   * 只有确实无主的残留才会被还原，避免把别人正在使用的项目级 override 改掉。
+   */
   async sweepInjections() {
-    const swept = [];
+    const reports = [];
     for (const entry of await pendingInjections()) {
-      const report = await this.#withProject(entry.project, async () => {
-        if (this.#projectActive(entry.project)) return undefined;
-        return { project: entry.project, cleaned: true, ...(await this.#cleanupProject(entry.project, true)) };
+      await this.#withProject(entry.project, async () => {
+        if (this.#projectActive(entry.project)) {
+          reports.push({ project: entry.project, cleaned: false, skipped: 'project-active', note: '该项目仍有活跃会话，不还原' });
+          return;
+        }
+        const owner = entry.owner;
+        if (owner?.pid && owner.pid !== process.pid && pidAlive(owner.pid)) {
+          reports.push({
+            project: entry.project,
+            cleaned: false,
+            skipped: 'owner-alive',
+            owner,
+            note: `注入者进程 ${owner.pid} 还活着（可能是另一个 server），不做还原以免破坏它正在用的注入`,
+          });
+          return;
+        }
+        reports.push({ project: entry.project, cleaned: true, ...(await this.#cleanupProject(entry.project, true)) });
       });
-      if (report) swept.push(report);
     }
-    return swept;
+    return reports;
   }
 
-  #spawn(kind, binary, args, projectPath, keepAwake) {
+  #spawn(kind, binary, args, projectPath, keepAwake, env, runtimePort) {
     const id = `${kind}-${randomUUID().slice(0, 8)}`;
     // keepAwake 默认开（除非显式 false）：长驻会话在这台机器上会被 App Nap 冻结，
     // 而且症状极难自查 —— 进程活着、端口在听、脚本不动。
@@ -297,6 +420,8 @@ export class ProcessRegistry {
       cwd: projectPath,
       projectPath,
       keepAwake: wrapped.keepAwake,
+      env,
+      runtimePort,
     }).start();
     this.processes.set(id, process_);
     process_.on('exit', () => {

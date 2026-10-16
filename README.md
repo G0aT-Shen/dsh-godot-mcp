@@ -3,45 +3,50 @@
 让我在 DSH 里**全盘控制 Godot 引擎**，覆盖从建项目到验收游戏的全部开发步骤。
 交付形态是**标准 stdio MCP server**，所以同一个 server 也能给 Codex / Claude Code / Cursor 用。
 
-## 快速开始（换一台电脑 / 全新环境）
+## Windows DSH 快速开始
 
-前置：**Node ≥ 20**、**Godot 4.7+**（本仓库**不含**引擎二进制，见下）、以及一个装好的 DSH。
+首个验收目标：Windows 11 x64、Node.js ≥ 20、Godot 4.7.2-stable、桌面 DSH 自带的 MCP 客户端。运行时不依赖 Mac、Codex、WSL、Python 或跨机桥；Godot 相关操作在这台 Windows 上执行。
 
-```bash
+在 PowerShell 中运行：
+
+```powershell
 git clone https://github.com/G0aT-Shen/dsh-godot-mcp.git
-cd dsh-godot-mcp
-node scripts/setup.mjs          # 自检 + 写 DSH 接线（幂等，改动前自动备份）
+Set-Location dsh-godot-mcp
+node scripts/setup.mjs --download-godot
 ```
 
-`setup.mjs` 会依次做四件事，任何一步不满足都会明确告诉你缺什么、怎么补：
+已有 Godot 可以指定绝对路径；路径可包含空格、中文和 `#`：
 
-1. 检查 Node 版本，并取出 node 的**绝对路径**（mcp-client 用 `scrubbedParentEnv()` 起子进程，`PATH` 里的 node 不可靠）；
-2. 找可用的 Godot：`GODOT_MCP_GODOT` → 随包 `tools/` → `/Applications/Godot.app` → `PATH`；
-   没装就用 `node scripts/setup.mjs --download-godot` 自动下到 `tools/`，
-   或者离线解包已有的官方 zip：`--godot-zip ~/Downloads/Godot_v4.7.2-stable_macos.universal.zip`；
-3. 在 DSH profile（默认 `~/.dsh/profiles/desktop`）的 `cordis.patch.yml` 里写入/更新 `godot-mcp-client` 条目；
-   值没变就一个字节都不改，改了就先备份成 `cordis.patch.yml.before-setup-<时间戳>`；
-4. 用配置里那条命令**真的起一次 server**（`initialize` + `tools/list`），确认 5 个工具都在。
+```powershell
+$env:GODOT_MCP_GODOT = 'C:\Godot 引擎 #1\Godot_v4.7.2-stable_win64.exe'
+node scripts/setup.mjs
+# 离线安装也可用：
+node scripts/setup.mjs --godot-zip 'C:\Downloads\Godot_v4.7.2-stable_win64.exe.zip'
+```
 
-然后重启 DSH（或等 mcp-client 热重连），让 agent 调一次 `mcp__godot__godot_status`，
-应当看到 `godot` / `opsEngine` / `server.build` 三段 —— 其中 `server.build.stale: false`
-表示 DSH 里跑的就是磁盘上这份代码（改完 `src/*.mjs` 后如果变 `true`，按提示 kill 掉那个 pid 即可）。
+安装器检测 Node/Godot，把 Node、MCP 入口和 Godot 的绝对路径写入 DSH profile，然后实际执行 `initialize` / `tools/list`，检查 5 个工具。默认 profile 是用户目录下 `.dsh/profiles/desktop`，其他安装位置请传 `--profile 'C:\路径\desktop'`。`--check` 只检查；重复安装保持配置不变，每次变更前创建 `before-setup-<时间戳>` 备份。
 
-> 想先看它要动什么、不写任何文件：`node scripts/setup.mjs --check`。
-> 只想给 Codex / Claude Code 用、不接 DSH：`codex mcp add godot -- node "$PWD/bin/godot-mcp.mjs"`。
+随后重启桌面 DSH，使 MCP 客户端重新加载。先调用 `mcp__godot__godot_status`，确认引擎存在且 `server.build.stale` 为 `false`。项目参数请使用 Windows 绝对路径，例如 `C:/Games/测试 #1`；`res://` 只用于项目内资源路径。
 
-### 仓库里有什么、没有什么
+### 更新与回退
 
-| | 说明 |
-|---|---|
-| 有 | 全部源码（Node 侧 + GDScript 三层）、零运行时依赖、9 个验收套件、真机验证证据（`verification/`） |
-| 没有 | **Godot 引擎二进制**（`tools/`，500MB+）、调研用的上游 clone（`reference/`）、示例项目（`demo-game/`）—— 见 `.gitignore` |
+更新前停止由 MCP 管理的游戏/编辑器，并正常退出 DSH；记录 `git rev-parse HEAD`，备份 profile 的 `cordis.patch.yml` 和 `package.json`。工作区有本地修改时先保留修改，再更新：
 
-平台：**macOS 实测**（Godot 4.7.2 / Apple M1，Node 24）。Linux / Windows 的代码路径存在但**未验证**：
-`run_project` 的输出分离依赖 `/bin/sh`，桥的常驻会话用 `caffeinate` 防 App Nap（非 macOS 自动跳过）。
+```powershell
+git pull --ff-only
+node scripts/setup.mjs --check
+node scripts/setup.mjs
+```
 
-**Windows DSH 独立使用尚未就绪**：已确认 POSIX 执行器、盘符路径校验和安装配置等兼容性阻碍，不能只换路径就交付。
-见 [Windows 兼容性检查与迁移方案](verification/WINDOWS-MIGRATION-20261016.md) 和 [当前桌面 DSH 更新及实际调用记录](verification/DSH-UPDATE-20261016.md)；本轮无 Windows 实机验证。
+重新打开 DSH 并检查构建指纹与 5 个工具。不要只替换磁盘文件后继续使用旧 MCP 进程。回退时在正常退出 DSH 后 `git switch --detach <先前记录的提交>`，还原此次安装前的 profile 备份，再打开 DSH。升级 Node 或移动仓库/Godot 后重跑安装器，更新绝对路径。
+
+`stop`、正常退出和 MCP 取消会清理受管理的进程和临时桥，恢复原有 `override.cfg`。操作系统强杀、断电不属于正常退出；遇到残留时先确认相关 Godot/MCP 进程均停止，保留项目和 `.mcp-backup` 备份，再使用恢复流程。不要删除仍在其他活跃会话中使用的注入文件。
+
+### 验证范围
+
+Windows CI 在原生 Windows runner 上使用 Node 20/24，覆盖安装器、真实 YAML、stdio MCP、Godot 操作、运行时桥、取消清理与 Windows release 导出。CI 的通过结果和剩余限制记录在 [本轮实施报告](verification/WINDOWS-IMPLEMENTATION-20261016.md)。Windows 桌面 DSH 的交互验收仍需要实际 Windows 设备；CI 不替代这项验收。
+
+仓库只包含源码，不包含引擎、导出模板和示例项目。运行时零 npm 依赖；`npm ci` 安装的是测试用 YAML 解析器。macOS 仍保留原生验证，Linux 不在本次交付验收范围。
 
 ## 它解决什么问题
 
@@ -113,7 +118,7 @@ GODOT_MCP_GODOT=/path/to/Godot node scripts/setup.mjs  # 用已有的引擎（�
 → 随包 `tools/` → `/Applications/Godot.app` → `PATH`。
 
 > 显式指定的路径是**严格**的：给错了会直接报错，不会悄悄换一个 Godot 版本跑。
-> 靠环境变量找到引擎时，`setup.mjs` 会把路径写进 profile 的 `env`（因为 DSH 起子进程会洗环境变量）。
+> 靠环境变量找到引擎时，`setup.mjs` 会把路径写进 profile 的 `env`（固定引擎版本和位置，避免自动发现产生歧义）。
 
 ### 2. 接入 DSH（当前采用：标准 MCP server）
 
@@ -127,19 +132,19 @@ GODOT_MCP_GODOT=/path/to/Godot node scripts/setup.mjs  # 用已有的引擎（�
       config:
         serverName: godot
         transport: stdio
-        command: /absolute/path/to/node      # 必须绝对路径（用 `command -v node` 查）
+        command: "C:/Program Files/nodejs/node.exe"  # 必须绝对路径（PowerShell 用 `(Get-Command node).Source` 查）
         args:
-          - /absolute/path/to/dsh-godot-mcp/bin/godot-mcp.mjs
-        cwd: /Users/you                        # 不传 project 参数时，从它向上找 project.godot
+          - "C:/Tools/dsh-godot-mcp/bin/godot-mcp.mjs"
+        cwd: "C:/Games"                        # 不传 project 参数时，从它向上找 project.godot
         toolCallTimeoutMs: 900000              # 默认 60s 太短，run_project/export_project 会超时
 ```
 
 三个必须注意的点：
 
-- `command` **必须用绝对路径**：mcp-client 用 `scrubbedParentEnv()` 起子进程，`PATH` 里的 `node` 不可依赖。
+- `command` **使用绝对路径**，固定 Node 版本。DSH 会过滤凭据变量和 `DSH_*`，一般保留 PATH、SystemRoot 和代理变量。
 - `toolCallTimeoutMs` 默认 60000，对 `run_project` / `export_project` 这类长任务不够。
 - 若 Godot 是靠环境变量才找到的，还要在 `config` 下加 `env: { GODOT_MCP_GODOT: <绝对路径> }`
-  —— 环境变量同样不会传给子进程（`setup.mjs` 会自动补上）。
+  —— `setup.mjs` 自动写入，固定所用引擎。
 
 工具会以 `mcp__godot__<name>` 暴露：`mcp__godot__godot`、`mcp__godot__godot_batch`、
 `mcp__godot__godot_session`、`mcp__godot__godot_connect`、`mcp__godot__godot_status`。
@@ -148,7 +153,7 @@ GODOT_MCP_GODOT=/path/to/Godot node scripts/setup.mjs  # 用已有的引擎（�
 > 服务注入（必须 `inject=['tools']` + `ctx.tools`，用 `ctx.get()` 拿不到）、
 > 注册时机、以及"模块被进程缓存、每次改代码都要重启"这几道坎；我在真实环境里
 > 连续两轮没能让它稳定激活。而 MCP 路径复用 DSH 已在跑的模块、改 server 源码只需
-> **重启那个 server 进程**（`kill -TERM <pid>`，mcp-client 的监管器数秒内自动拉起）
+> **重启 DSH 的 MCP 客户端或正常退出后重开 DSH**
 > 即可生效，且同一个 server 还能给 Codex / Claude Code / Cursor 用。
 > `godot_status` 会回报 `server.build.loaded / onDisk / stale` —— 「跑的是不是旧构建」
 > 不再需要靠猜（这条是真机踩过一次才补上的，见 SUMMARY 第 11 节）。
@@ -164,7 +169,7 @@ claude mcp add godot -- node "$PWD/bin/godot-mcp.mjs"
 ```
 
 协议层已独立验证（`node scripts/verify-mcp.mjs`，17 项：initialize / tools/list /
-tools/call / 错误码，含在**洗过的干净环境**下仍能找到 Godot）。
+tools/call / 错误码，含在**按 DSH 规则过滤敏感变量的环境**下仍能找到 Godot）。
 CLI 也可以不开客户端直接用：`node bin/godot-mcp.mjs status` / `op <op> '<json>'` / `tools`。
 
 ## 用法
@@ -208,32 +213,21 @@ CLI 也可以不开客户端直接用：`node bin/godot-mcp.mjs status` / `op <o
 
 ## 导出成品
 
-导出模板已装在 `~/Library/Application Support/Godot/export_templates/4.7.2.stable`（macOS 上需要先在
-Godot 编辑器里装一次导出模板；Linux/Windows 同理）。两个实测要点：
+先在 Godot 编辑器的“管理导出模板”中安装与引擎版本相符的模板。Windows 默认位置为 `%APPDATA%/Godot/export_templates/4.7.2.stable`；至少需要 `windows_release_x86_64.exe`。在项目中建立 `Windows Desktop` 导出预设，再调用：
 
-1. **必须先启用 ETC2 ASTC**，否则 macOS universal/arm64 导出会被 Godot 以 `configuration errors` 直接拒绝：
+```
+godot(op="export_project", params={preset:"Windows Desktop", output_path:"C:/Games/MyGame/dist/Game.exe", debug:false})
+```
 
-   ```
-   godot(op="write_settings", params={settings:{"rendering/textures/vram_compression/import_etc2_astc": true}})
-   ```
-
-2. 导出物是 **`.app` 目录**（bundle），不是单个文件：
-
-   ```
-   godot(op="export_project", params={preset:"macOS", output_path:"<项目>/dist/Game.app"})
-   ```
-
-> **安全提示**：用 `godot_session(action="setup")` 装过桥的项目，如果直接导出发布，成品里会带上
-> 编辑器/运行时桥。运行时桥**已做门控**：release 构建默认不监听，只有显式
-> `GODOT_MCP_RUNTIME_FORCE=1` 时才开启（用于刻意要在成品里远程调试的场景）。
-> 这条门控是被真实利用后才加上去的 —— 详见 [verification/SUMMARY.md](./verification/SUMMARY.md) 第 6 节。
+macOS 使用 `macOS` 预设和 `.app` 目录，并需要启用 ETC2 ASTC 纹理导入。已安装运行时桥的 release 成品默认不开放控制端口；只有显式 `GODOT_MCP_RUNTIME_FORCE=1` 才开启。`verify-export.mjs` 验证成品持续运行期间端口关闭，再验证 opt-in 后 `rt.eval` 返回 42。
 
 ## 验证
 
 ```bash
-node --test test/*.test.mjs                          # 单元/插件/安装器（69 项，含构建指纹与 profile 补丁守卫）
+npm ci                              # 安装测试依赖
+npm test                            # 完整单元、安装器、配置与真实 Godot 生命周期测试
 node scripts/verify-wiring.mjs    # DSH 接线自检：按配置真起一次 server（没装 DSH 时明确跳过）
-node scripts/verify-mcp.mjs       # 协议层：initialize / tools/list / tools/call / 错误码（洗过的干净环境）
+node scripts/verify-mcp.mjs       # 协议层：initialize / tools/list / tools/call / 错误码（按 DSH 规则过滤敏感变量的环境）
 node scripts/verify-e2e.mjs       # 端到端：建项目→建场景→加节点→挂脚本→运行→逃生舱→装桥
 node scripts/verify-diagnostics.mjs # 诊断质量：级联归属 / 类缓存自愈 / 显示模式回报 / 助手脚本目录
 node scripts/verify-l2.mjs        # 编辑器实时桥（真实 WebSocket）
@@ -242,11 +236,7 @@ node scripts/verify-l3.mjs              # 同上，另含截图相关断言（�
 node scripts/verify-export.mjs    # release 导出 + 门控（成品 9091 不监听 / opt-in 后可用）
 ```
 
-合计 **226 项真机断言**（69 + 15 + 17 + 19 + 25 + 13 + 59 + 9；L3 换成带窗口版是 233 项）。
-不含 `verify-mcp` 的口径是 **209 项**（= 69 + 15 + 19 + 25 + 13 + 59 + 9）。
-最近一次全量重跑（2026-10-15）的逐套件数字、原始日志与当轮修掉的三个缺陷见
-[verification/rerun-20261015-0450/REPORT.md](./verification/rerun-20261015-0450/REPORT.md)
-与 [verification/SUMMARY.md](./verification/SUMMARY.md) 第 11 节。
+当前断言数与平台结果以 [本轮实施报告](verification/WINDOWS-IMPLEMENTATION-20261016.md) 及 GitHub Actions 日志为准。此前 macOS 全量验证记录见 [2026-10-15 报告](verification/rerun-20261015-0450/REPORT.md)；历史记录不能作为当前 Windows 版本的通过证据。
 
 真机验证证据见：
 - [verification/ops-gd.md](./verification/ops-gd.md) —— L1 每个 op 的真实命令与输出

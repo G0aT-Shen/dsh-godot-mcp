@@ -731,3 +731,71 @@ test('initialize 的 serverInfo 带构建指纹（客户端一连上就能看到
   assert.equal(reply.result.serverInfo.build, LOADED_BUILD.id);
   assert.equal(SERVER_INFO.build, LOADED_BUILD.id);
 });
+
+// ------------------------------------------------- owner-aware 注入回收
+//
+// override.cfg 是**项目级**配置：如果另一个还活着的 server（或还跑着的游戏）正靠它工作，
+// 「清理残留」把它还原掉就会破坏别人。所以回收必须同时满足「本项目无活跃会话」+
+// 「记录里的注入者进程已经不在」。这里把两条安全线都钉住。
+
+test('sweepStaleInjections：注入者进程还活着时不做还原（onSkip 如实汇报原因）', async () => {
+  await withTempProject('gmcp-owner-', async dir => {
+    await injection.injectTransientBridge(dir);
+    // 把自己注入的条目改成「另一个还活着的进程」所有（本测试的父进程），模拟另一个 server
+    const stateFile = injection.TRANSIENT_STATE_FILE();
+    const state = JSON.parse(await fsp.readFile(stateFile, 'utf8'));
+    state.projects[dir].owner = { pid: process.ppid, host: 'other-server' };
+    await fsp.writeFile(stateFile, JSON.stringify(state), 'utf8');
+    const skips = [];
+    const swept = await injection.sweepStaleInjections({
+      isActive: () => false,
+      ownerAlive: () => true,
+      onSkip: report => skips.push(report),
+    });
+    assert.deepEqual(swept, [], '注入者还活着时不能清理');
+    assert.equal(skips.length, 1);
+    assert.equal(skips[0].skipped, 'owner-alive');
+    assert.equal(existsSync(path.join(dir, 'override.cfg')), true, '注入必须原地保留');
+
+    // 注入者进程消失（模拟被强杀）之后才允许回收
+    const cleaned = await injection.sweepStaleInjections({ isActive: () => false, ownerAlive: () => false });
+    assert.equal(cleaned.length, 1);
+    assert.equal(cleaned[0].cleaned, true);
+    assert.equal(existsSync(path.join(dir, 'override.cfg')), false);
+  });
+});
+
+test('sweepStaleInjections：本项目仍有活跃会话时跳过（不还原）', async () => {
+  await withTempProject('gmcp-owner-active-', async dir => {
+    await injection.injectTransientBridge(dir);
+    const skips = [];
+    const swept = await injection.sweepStaleInjections({
+      isActive: p => p === dir,
+      ownerAlive: () => false,
+      onSkip: report => skips.push(report),
+    });
+    assert.deepEqual(swept, []);
+    assert.equal(skips[0].skipped, 'project-active');
+    assert.equal(existsSync(path.join(dir, 'override.cfg')), true);
+  });
+});
+
+test('ProcessRegistry.sweepInjections：另一个还活着的 server 的注入不会被误清', async () => {
+  await withTempProject('gmcp-registry-sweep-', async dir => {
+    await injection.injectTransientBridge(dir);
+    // 把 owner 改成一个「确定还活着」的进程（本测试的父进程），模拟另一个 server 的注入
+    const stateFile = injection.TRANSIENT_STATE_FILE();
+    const state = JSON.parse(await fsp.readFile(stateFile, 'utf8'));
+    state.projects[dir].owner = { pid: process.ppid, host: 'test-host' };
+    await fsp.writeFile(stateFile, JSON.stringify(state), 'utf8');
+
+    const { ProcessRegistry } = await import('../src/processes.mjs');
+    const registry = new ProcessRegistry();
+    const reports = await registry.sweepInjections();
+    const entry = reports.find(item => item.project === dir);
+    assert.ok(entry, '必须返回该项目的处理结果（而不是悄悄跳过）');
+    assert.equal(entry.cleaned, false);
+    assert.equal(entry.skipped, 'owner-alive');
+    assert.equal(existsSync(path.join(dir, 'override.cfg')), true, '别人正在用的注入不能被还原');
+  });
+});

@@ -21,17 +21,17 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { existsSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { godotStatus } from '../src/godot.mjs';
-import { probeMcpServer } from './lib/probe-mcp.mjs';
+import { PINNED_GODOT_VERSION, godotStatus } from '../src/godot.mjs';
+import { assertZipFile, godotAssetName, locateGodotBinary, unpackZip } from './lib/godot-install.mjs';
+import { probeEnvReport, probeMcpServer } from './lib/probe-mcp.mjs';
 import { ENTRY_ID, buildEntryBlock, buildHeader, patchPatchText, validatePatchText } from './lib/profile-patch.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_ENTRY = path.join(REPO, 'bin', 'godot-mcp.mjs');
 const SERVER_NAME = 'godot';
 const EXPECTED_TOOLS = ['godot', 'godot_batch', 'godot_session', 'godot_connect', 'godot_status'];
-const GODOT_VERSION = '4.7.2-stable';
+const GODOT_VERSION = PINNED_GODOT_VERSION;
 const LEGACY_PACKAGE_NAMES = ['@hanyangshen/godot-mcp', 'dsh-godot-mcp'];
 
 const argv = process.argv.slice(2);
@@ -65,13 +65,9 @@ async function checkNode() {
 
 // ----------------------------------------------------------------- 2. Godot
 
-/** 官方发布资产名（按平台）。 */
-function godotAssetName() {
-  const arch = os.arch();
-  if (process.platform === 'darwin') return `Godot_v${GODOT_VERSION}_macos.universal.zip`;
-  if (process.platform === 'win32') return `Godot_v${GODOT_VERSION}_win64.exe.zip`;
-  if (arch === 'arm64') return `Godot_v${GODOT_VERSION}_linux.arm64.zip`;
-  return `Godot_v${GODOT_VERSION}_linux.x86_64.zip`;
+/** 官方发布资产名（按平台/架构）。实现见 scripts/lib/godot-install.mjs（可单测）。 */
+function assetName() {
+  return godotAssetName({ version: GODOT_VERSION });
 }
 
 async function download(url, dest, label, { accept } = {}) {
@@ -108,7 +104,7 @@ async function download(url, dest, label, { accept } = {}) {
 
 /** GitHub 直链下不动时，改走 API 资产端点（本机实测过这条路）。 */
 async function downloadViaApi(dest) {
-  const asset = godotAssetName();
+  const asset = assetName();
   const releaseUrl = `https://api.github.com/repos/godotengine/godot/releases/tags/${GODOT_VERSION}`;
   const release = await fetch(releaseUrl, { signal: AbortSignal.timeout(120_000), headers: { Accept: 'application/vnd.github+json' } });
   if (!release.ok) throw new Error(`GitHub API ${release.status}`);
@@ -120,38 +116,6 @@ async function downloadViaApi(dest) {
   });
 }
 
-function tryUnzip(zipPath, destDir) {
-  const attempts = [
-    ['unzip', ['-q', '-o', zipPath, '-d', destDir]],
-    ['tar', ['-xf', zipPath, '-C', destDir]],
-    ['ditto', ['-x', '-k', zipPath, destDir]],
-  ];
-  for (const [command, args] of attempts) {
-    const result = spawnSync(command, args, { stdio: 'pipe' });
-    if (result.error?.code === 'ENOENT') continue;
-    if (result.status === 0) return command;
-  }
-  return undefined;
-}
-
-/** 解包后把可执行文件找出来（macOS 是 .app bundle，Linux/Windows 是单文件）。 */
-async function locateGodotBinary(dir) {
-  const candidates = [];
-  if (process.platform === 'darwin') {
-    candidates.push(path.join(dir, 'Godot.app', 'Contents', 'MacOS', 'Godot'));
-  }
-  for (const entry of await fsp.readdir(dir).catch(() => [])) {
-    if (/^Godot.*\.(exe)?$/i.test(entry) || /^Godot_v.*/.test(entry)) candidates.push(path.join(dir, entry));
-  }
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      await fsp.chmod(candidate, 0o755).catch(() => {});
-      return candidate;
-    }
-  }
-  return candidates[0];
-}
-
 async function ensureGodot() {
   const directHint = process.env.GODOT_MCP_GODOT ?? process.env.GODOT_PATH ?? process.env.GODOT4 ?? process.env.GODOT;
   let status = await godotStatus(undefined);
@@ -160,11 +124,13 @@ async function ensureGodot() {
     // 因为 DSH 起子进程时用的是 scrubbedParentEnv，环境变量不会传下去。
     const source = status.path.startsWith(path.join(REPO, 'tools')) ? 'bundled' : directHint ? 'env' : 'system';
     note(true, `找到 Godot ${status.version ?? ''}`.trim(), `${status.path}（来源：${source}）`);
-    return { ok: true, path: status.path, source, pinEnv: source === 'env' };
+    // 一律把选中的绝对路径钉进 profile：DSH 起 server 用 scrubbedParentEnv，
+    // 环境变量不会传下去；Windows 上「PATH 里有 godot」尤其不可依赖。
+    return { ok: true, path: status.path, source, pinEnv: true };
   }
 
   if (flag('download-godot') || option('godot-zip')) {
-    const zip = option('godot-zip') ? path.resolve(option('godot-zip')) : path.join(REPO, 'tools', godotAssetName());
+    const zip = option('godot-zip') ? path.resolve(option('godot-zip')) : path.join(REPO, 'tools', assetName());
     if (option('godot-zip')) {
       note(null, '使用本地 zip 解包（离线模式）', zip);
     } else if (existsSync(zip)) {
@@ -172,7 +138,7 @@ async function ensureGodot() {
     } else {
       try {
         await download(
-          `https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/${godotAssetName()}`,
+          `https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/${assetName()}`,
           zip,
           `Godot ${GODOT_VERSION}（直链）`,
         );
@@ -181,28 +147,58 @@ async function ensureGodot() {
         await downloadViaApi(zip);
       }
     }
-    const used = tryUnzip(zip, path.join(REPO, 'tools'));
-    if (!used) {
-      note(false, '解包失败：unzip / tar / ditto 都不可用', '手动解压后把 Godot 放到 tools/ 或设置 GODOT_MCP_GODOT');
+    try {
+      assertZipFile(zip);
+    } catch (error) {
+      note(false, 'zip 校验失败，不解包', String(error.message).slice(0, 200));
       return { ok: false };
     }
-    note(null, `解包完成（${used}）`, path.join(REPO, 'tools'));
-    status = await godotStatus(undefined);
-    if (status.ok) {
-      note(true, `Godot 就绪：${status.version}`, status.path);
-      return { ok: true, path: status.path, source: 'bundled', pinEnv: false };
+    const unpacked = unpackZip(zip, path.join(REPO, 'tools'));
+    if (!unpacked.command) {
+      note(false, '解包失败：所有解包方式都不可用', unpacked.failures.join(' | '));
+      say('  Windows 上可用：tar（Win10+ 自带）或 PowerShell：Expand-Archive -LiteralPath <zip> -DestinationPath tools -Force');
+      return { ok: false };
     }
+    note(null, `解包完成（${unpacked.command}）`, path.join(REPO, 'tools'));
+
+    // 解包成功 ≠ 能用：官方 Windows zip 解出来是**版本化文件名**
+    // （Godot_v4.7.2-stable_win64.exe），旧实现解完包又走一遍通用 resolver，
+    // 结果在 Windows 上找不到刚解出来的 exe。这里显式定位 + **真跑一次 --version** 校验，
+    // 再把绝对路径钉进 profile。
+    const toolsDir = path.join(REPO, 'tools');
+    const located = locateGodotBinary(toolsDir, { version: GODOT_VERSION });
+    if (!located) {
+      note(false, '解包后没有在 tools/ 下找到 Godot 可执行文件', toolsDir);
+      return { ok: false };
+    }
+    // 注意：`located` 在 macOS 上是 Godot.app/Contents/MacOS/Godot 这样的**完整路径**，
+    // 早先把它 basename 之后再 join 回 tools/，等于把 .app 结构压扁成一个不存在的文件，
+    // 于是「解包成功却报跑不起来」。直接拿完整路径去校验。
+    const verified = await godotStatus(located);
+    if (!verified.ok) {
+      note(false, `解包后的 Godot 跑不起来：${path.basename(located)}`, String(verified.error ?? '').slice(0, 200));
+      return { ok: false };
+    }
+    note(true, `解包并校验通过：Godot ${verified.version}`, verified.path);
+    return { ok: true, path: verified.path, source: 'bundled', pinEnv: true };
   }
 
   note(false, '没找到可用的 Godot 4.7+', status.error ?? '');
+  const checked = status.checked;
+  if (checked) {
+    say('\n  找过这些位置（用于判断是「没装」还是「装了但没被认出来」）：');
+    for (const candidate of [...(checked.bundled ?? []), ...(checked.system ?? [])].slice(0, 14)) say(`    - ${candidate}`);
+    say(`    PATH 里找过：${(checked.pathNames ?? []).slice(0, 8).join(', ')}`);
+    for (const note_ of checked.notes ?? []) say(`    ${note_}`);
+  }
   say(
     '\n  请任选一种：\n' +
-      '    a) 装官方 Godot 4.7+（.app / 可执行文件放 /Applications 或 PATH 里都能自动找到）\n' +
+      '    a) 装官方 Godot 4.7+：Windows 下载 zip 解到任意目录后设置绝对路径（见 README 的 PowerShell 步骤）\n' +
       `       下载页：https://github.com/godotengine/godot/releases/tag/${GODOT_VERSION}\n` +
       '    b) 让本脚本下载并解包到 tools/：node scripts/setup.mjs --download-godot\n' +
-      '       已有官方 zip 时离线解包：node scripts/setup.mjs --godot-zip ~/Downloads/Godot_v4.7.2-stable_macos.universal.zip\n' +
+      `       已有官方 zip 时离线解包：node scripts/setup.mjs --godot-zip <Godot_v${GODOT_VERSION}_win64.exe.zip>\n` +
       '    c) 直接指定路径（同时写进 DSH 配置的 env，避免被 scrubbed env 洗掉）：\n' +
-      '       GODOT_MCP_GODOT=/path/to/Godot node scripts/setup.mjs\n',
+      '       Windows PowerShell：$env:GODOT_MCP_GODOT="C:\\Godot\\Godot_v4.7.2-stable_win64.exe"; node scripts/setup.mjs\n',
   );
   return { ok: false };
 }
@@ -333,7 +329,9 @@ async function main() {
   }
 
   const godot = await ensureGodot();
-  const pinGodot = godot.ok === true && godot.pinEnv === true;
+  // pinGodot：把选中的 Godot 绝对路径写进 profile 的 env.GODOT_MCP_GODOT。
+  // 只要定位到了真实可执行文件就钉 —— 这是 Windows 上「首次安装后 DSH 一定找得到引擎」的关键。
+  const pinGodot = godot.ok === true && Boolean(godot.path);
   if (godot.ok !== true) process.exitCode = 1;
 
   say('');
@@ -341,6 +339,8 @@ async function main() {
   await checkStaleDeps();
 
   say('\n自检');
+  const envReport = probeEnvReport();
+  note(null, `探针环境（${envReport.platform}）`, `${envReport.note}；保留 ${envReport.keys.length} 个变量`);
   const serverOk = await selfCheck({ node: node.node, godot, pinGodot });
 
   say('\n=== 结果 ===');

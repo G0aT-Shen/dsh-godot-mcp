@@ -35,6 +35,10 @@ export const BUILD_INPUTS = [
   'src/inject.mjs',
   'src/tools.mjs',
   'src/diagnose.mjs',
+  // 跨平台进程树回收 + 嵌套执行助手：两者都参与运行时行为，
+  // 漏掉它们会让「磁盘代码已修、活体 server 还是旧行为」这类事故重新变得不可见。
+  'src/proc-tree.mjs',
+  'src/nested-helper.mjs',
 ];
 
 /**
@@ -64,8 +68,9 @@ export const LOADED_BUILD = computeBuildId();
 
 /** 重启 server 进程即可加载新代码；mcp-client 的监管器会自动把它拉起来。 */
 export const STALE_HINT =
-  '磁盘上的源码与当前进程加载的不一致：改完 `src/*.mjs` 后必须重启这个 server 进程才生效 —— ' +
-  '`kill -TERM <pid>` 即可，DSH 的 mcp-client 监管器会在数秒内自动重启并加载新代码。';
+  '磁盘上的源码与当前进程加载的不一致：改完 `src/*.mjs` 后必须重启这个 server 进程才生效。' +
+  'Windows：重启 DSH 桌面客户端（或让 MCP 客户端重连）；macOS/Linux：`kill -TERM <pid>`，' +
+  'DSH 的 mcp-client 监管器会在数秒内自动拉起并加载新代码。';
 
 /**
  * 对比「进程加载的」与「磁盘上的」源码。

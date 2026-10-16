@@ -92,6 +92,58 @@ var listening: bool = false          # true only once the port is really open
 var gate_reason: String = ""         # non-empty => the security gate closed it
 
 
+# ------------------------------------------------------------- port source --
+
+## 端口来源优先级：GODOT_MCP_RUNTIME_PORT（显式）→ 注入/安装目录里的 port.cfg → 默认 9091。
+##
+## port.cfg 是 MCP server 为「自定义端口 / 同机多项目」写下的文件
+## （见 src/inject.mjs：`.godot/mcp_bridge/port.cfg`）。旧实现只在注入侧写、运行时侧
+## 完全不读，于是 `godot_session(game, runtimePort=…, bridge="transient")` 之后游戏仍然
+## 监听 9091：客户端要么连不上，要么**连到另一个项目的游戏上**（同机多项目时尤其危险）。
+func _configured_port() -> int:
+	var env_port: String = OS.get_environment(ENV_PORT).strip_edges()
+	if env_port.is_valid_int():
+		var from_env := int(env_port)
+		if from_env > 0 and from_env < 65536:
+			return from_env
+	for candidate in _port_cfg_paths():
+		if not FileAccess.file_exists(candidate):
+			continue
+		var cfg := ConfigFile.new()
+		if cfg.load(candidate) != OK:
+			continue
+		var value := int(cfg.get_value("mcp", "port", 0))
+		if value > 0 and value < 65536:
+			return value
+	return 0
+
+## port.cfg 的候选位置：零足迹注入目录 + 脚本旁边（已安装 addon 的形态）。
+func _port_cfg_paths() -> Array:
+	var dirs: Array = ["res://.godot/mcp_bridge"]
+	var script: Script = get_script()
+	if script != null:
+		var script_path := String(script.resource_path)
+		if not script_path.is_empty():
+			dirs.append(script_path.get_base_dir())
+	var out: Array = []
+	for dir in dirs:
+		out.append(str(dir).path_join("port.cfg"))
+	return out
+
+## 项目身份：用于让客户端确认「这个端口上的游戏是不是我要的那个项目」。
+## 路径统一成正斜杠：Windows 上 globalize_path 回的是反斜杠，而客户端比较时
+## 需要跨平台一致的形式。注意 GDScript 里 `"\\"` 就是**一个**反斜杠。
+func _identity() -> Dictionary:
+	return {
+		"project": ProjectSettings.globalize_path("res://").replace("\\", "/"),
+		"project_name": String(ProjectSettings.get_setting("application/config/name", "")),
+		"pid": OS.get_process_id(),
+		"port": port,
+		"protocol": PROTOCOL,
+		"listening": listening,
+	}
+
+
 # ---------------------------------------------------------------- lifecycle --
 
 func _ready() -> void:
@@ -99,9 +151,9 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_install_error_recorder()
 	_debug = _env_flag(ENV_DEBUG)
-	var env_port: String = OS.get_environment(ENV_PORT).strip_edges()
-	if env_port.is_valid_int():
-		port = int(env_port)
+	var configured := _configured_port()
+	if configured > 0:
+		port = configured
 
 	# Security gate — see the file header. Never open a control port on our own
 	# inside a release build.
@@ -337,7 +389,17 @@ func _execute(op: String, params: Dictionary) -> Dictionary:
 			result = _op_quit(params)
 		# --- additive extras ---------------------------------------------------
 		"rt.ping":
-			result = _ok({"pong": true, "nonce": params.get("nonce", null), "port": port, "protocol": PROTOCOL})
+			result = _ok({
+				"pong": true,
+				"nonce": params.get("nonce", null),
+				"port": port,
+				"protocol": PROTOCOL,
+				# 身份字段：客户端据此判断端口后面的游戏属于哪个项目，
+				# 避免「端口占用/接错项目」被当成连接成功。
+				"project": _identity().get("project", ""),
+				"project_name": _identity().get("project_name", ""),
+				"pid": OS.get_process_id(),
+			})
 		"rt.wait":
 			result = await _op_wait(params)
 		"rt.performance":

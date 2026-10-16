@@ -312,6 +312,54 @@ async function checkHelperDirs(controller) {
   }
 }
 
+/**
+ * 4. 「检查没跑完」不能被报成「代码是干净的」。
+ *
+ * parse_check(deep) 对每个可疑文件真跑一次 `--check-only`。旧实现只看 stderr：
+ * 如果那次嵌套检查**超时/异常退出**（exit 137、timed_out、孤儿进程），
+ * 它会认为「没有错误」→ 调用方拿到 `errors: []`，把不可信的结论当成干净代码。
+ *
+ * 这里用**确定性**的方式触发同一类分支：故意造出超过 NESTED_CHECK_ATTEMPTS(25) 的
+ * 可疑文件，让后续文件走「attempt cap」这条「检查没跑完」的路径，断言：
+ *   · 这些文件被显式记为 check_failed；
+ *   · 顶层 incomplete 为 true，checks_failed 计数正确；
+ *   · 不会被伪装成 0 errors。
+ */
+async function checkUntrustedChecksAreNotReportedClean(controller) {
+  section('4. 检查没跑完时不能谎报「没有错误」');
+  const dir = await makeProject('untrusted', controller);
+  const total = 28; // > NESTED_CHECK_ATTEMPTS(25)
+  for (let index = 0; index < total; index += 1) {
+    await fsp.writeFile(
+      path.join(dir, `broken_${index}.gd`),
+      `extends Node\n\nfunc broken_${index}( -> void:\n\tpass\n`,
+      'utf8',
+    );
+  }
+  const result = await controller.op('parse_check', { deep: true }, { project: dir, timeoutMs: 600_000 });
+  const data = result.data ?? {};
+  record(
+    'deep parse_check 真的执行了',
+    result.ok === true,
+    result.ok ? `checked=${data.checked}` : result.error,
+  );
+  record(
+    '超过尝试上限的文件被显式标为 check_failed（而不是当作干净）',
+    Array.isArray(data.errors) && data.errors.some(item => item.check_failed === true),
+    `errors=${(data.errors ?? []).length} checks_failed=${data.checks_failed}`,
+  );
+  record(
+    '顶层 incomplete=true 且 checks_failed>0',
+    data.incomplete === true && Number(data.checks_failed) > 0,
+    `incomplete=${data.incomplete} checks_failed=${data.checks_failed}`,
+  );
+  record(
+    '结果里没有任何「假装干净」的空间：errors 非空',
+    Array.isArray(data.errors) && data.errors.length > 0,
+    `unique_errors=${data.unique_errors}`,
+  );
+}
+
 async function exists(target) {
   try {
     await fsp.stat(target);
@@ -337,6 +385,7 @@ async function main() {
   await checkAttachSelfHeal(controller);
   await checkRunProjectDisplay(controller);
   await checkHelperDirs(controller);
+  await checkUntrustedChecksAreNotReportedClean(controller);
 }
 
 main()

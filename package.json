@@ -23,7 +23,7 @@
   },
   "scripts": {
     "setup": "node scripts/setup.mjs",
-    "test": "node --test test/unit.test.mjs test/plugin.test.mjs test/setup.test.mjs test/lifecycle.test.mjs",
+    "test": "node --test test/unit.test.mjs test/plugin.test.mjs test/setup.test.mjs test/windows-config.test.mjs test/windows-discovery.test.mjs test/nested-exec.test.mjs test/runtime-port.test.mjs test/runtime-target.test.mjs test/lifecycle.test.mjs test/nested-godot-cancel.test.mjs",
     "verify": "node scripts/verify-e2e.mjs",
     "verify:mcp": "node scripts/verify-mcp.mjs",
     "verify:wiring": "node scripts/verify-wiring.mjs",
@@ -31,7 +31,8 @@
     "verify:l2": "node scripts/verify-l2.mjs",
     "verify:l3": "node scripts/verify-l3.mjs",
     "verify:export": "node scripts/verify-export.mjs",
-    "mcp": "node bin/godot-mcp.mjs serve"
+    "mcp": "node bin/godot-mcp.mjs serve",
+    "test:quick": "node --test test/unit.test.mjs test/plugin.test.mjs test/setup.test.mjs test/windows-config.test.mjs test/windows-discovery.test.mjs test/nested-exec.test.mjs test/runtime-port.test.mjs test/runtime-target.test.mjs"
   },
   "dsh": {
     "bundle": {
@@ -47,5 +48,8 @@
     "godot",
     "godot-engine",
     "model-context-protocol"
-  ]
+  ],
+  "devDependencies": {
+    "yaml": "^2.9.1"
+  }
 }

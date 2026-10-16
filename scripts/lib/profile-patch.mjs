@@ -22,11 +22,102 @@ export const CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
 export const SERVER_NAME = 'godot';
 export const TOOL_CALL_TIMEOUT_MS = 900000;
 
+/**
+ * 把值写成 YAML **双引号风格**标量。
+ *
+ * 为什么路径必须引号化：`C:\DSH #1\Godot` 这类路径在普通（plain）标量里
+ * ` #` 之后会被当成注释，真实 YAML 解析器只读到 `C:\DSH`；反斜杠在双引号风格里
+ * 也必须转义，否则 `\n`、`\t` 会被解析成控制字符。
+ *
+ * 只用双引号风格还有一个好处：YAML 规范化后**没有歧义**，不需要再猜
+ * plain/single/folded 的边界情况，兜底解析器（{@link decodeYamlScalar}）
+ * 与真实解析器能给出同一结果。
+ *
+ * @param {unknown} value
+ * @returns {string} 带引号的标量（含首尾双引号）
+ */
+export function yamlDoubleQuote(value) {
+  let out = '"';
+  for (const ch of String(value)) {
+    const code = ch.codePointAt(0);
+    if (ch === '\\') out += '\\\\';
+    else if (ch === '"') out += '\\"';
+    else if (code < 0x20 || code === 0x7f) out += `\\x${code.toString(16).padStart(2, '0')}`;
+    else out += ch;
+  }
+  return `${out}"`;
+}
+
+/**
+ * 解析「一个单行标量」——双引号 / 单引号 / 普通三种风格。
+ * 与 {@link yamlDoubleQuote} 严格互逆（本仓库写出去的永远是双引号风格）。
+ * @param {string} raw 冒号或 `- ` 之后的原始文本（可含行尾空白）
+ * @returns {string}
+ */
+export function decodeYamlScalar(raw) {
+  const text = String(raw ?? '').trim();
+  if (text.startsWith('"')) {
+    let out = '';
+    for (let i = 1; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === '"') break; // 收尾引号：其后应为注释或空
+      if (ch !== '\\') {
+        out += ch;
+        continue;
+      }
+      const next = text[i + 1];
+      i += 1;
+      if (next === 'n') out += '\n';
+      else if (next === 't') out += '\t';
+      else if (next === 'r') out += '\r';
+      else if (next === '0') out += '\0';
+      else if (next === 'x') {
+        out += String.fromCharCode(Number.parseInt(text.slice(i + 1, i + 3), 16) || 0);
+        i += 2;
+      } else if (next === 'u') {
+        out += String.fromCharCode(Number.parseInt(text.slice(i + 1, i + 5), 16) || 0);
+        i += 4;
+      } else if (next === undefined) out += '\\';
+      else out += next; // \\ \" \/ 等：原样还原
+    }
+    return out;
+  }
+  if (text.startsWith("'")) {
+    // 单引号风格：只有 '' 一种转义
+    let body = text.slice(1);
+    const closing = body.lastIndexOf("'");
+    if (closing >= 0) body = body.slice(0, closing);
+    return body.replace(/''/g, "'");
+  }
+  // 普通风格：` #` 起是注释
+  const hash = text.search(/\s#/);
+  return (hash >= 0 ? text.slice(0, hash) : text).trim();
+}
+
+/**
+ * 判断一个值是不是绝对路径。跨平台判定，用于**校验**别的机器上写下的配置：
+ *   - POSIX：`/dir/node`
+ *   - Windows 盘符：`C:\dir\node.exe`、`C:\dir`、`c:/dir/node.exe`
+ *   - UNC：`\\server\share\node.exe`、`//server/share/node.exe`
+ * 不接受 `~`、相对路径、单独的 `\dir`（无盘符的根相对路径在 Windows 上依赖当前盘，
+ * 属于「看起来像绝对路径其实不是」的坑）。
+ * @param {string} value
+ * @returns {boolean}
+ */
+export function isAbsolutePathValue(value) {
+  const text = String(value ?? '');
+  if (!text) return false;
+  if (text.startsWith('/')) return true; // POSIX 或 UNC 的 //server/share 形态
+  if (/^[A-Za-z]:[\\/]/.test(text)) return true;
+  if (/^\\\\[^\\/]+[\\/][^\\/]+/.test(text)) return true; // \\server\share
+  return false;
+}
+
 /** 生成条目上方那段说明注释（缩进 4 格，和 insert 子数组里的条目对齐）。 */
 export function buildHeader() {
   return [
     '    # --- dsh-godot-mcp：标准 stdio MCP server（由 scripts/setup.mjs 写入/更新）---',
-    '    # command 必须是绝对路径：mcp-client 用 scrubbedParentEnv() 起子进程，PATH 里的 node 不可依赖。',
+    '    # command 必须是绝对路径：mcp-client 用 scrubbedParentEnv() 起子进程时环境不可假定，',
     `    # toolCallTimeoutMs 放宽到 ${TOOL_CALL_TIMEOUT_MS}：默认 60s 对 run_project / export_project 不够。`,
   ].join('\n');
 }
@@ -38,20 +129,42 @@ export function buildHeader() {
 export function buildEntryBlock({ node, serverEntry, cwd, godotPath }) {
   const lines = [
     `    - id: ${ENTRY_ID}`,
-    `      name: "${CLIENT_PACKAGE}"`,
+    `      name: ${yamlDoubleQuote(CLIENT_PACKAGE)}`,
     '      config:',
     `        serverName: ${SERVER_NAME}`,
     '        transport: stdio',
-    `        command: ${node}`,
+    `        command: ${yamlDoubleQuote(node)}`,
     '        args:',
-    `          - ${serverEntry}`,
-    `        cwd: ${cwd}`,
+    `          - ${yamlDoubleQuote(serverEntry)}`,
+    `        cwd: ${yamlDoubleQuote(cwd)}`,
     `        toolCallTimeoutMs: ${TOOL_CALL_TIMEOUT_MS}`,
   ];
-  // 只有「靠环境变量才找到 Godot」时才钉进 env —— DSH 起子进程用 scrubbedParentEnv，
-  // 环境变量不会传下去，不钉就会在运行时找不到引擎。
-  if (godotPath) lines.push('        env:', `          GODOT_MCP_GODOT: ${godotPath}`);
+  // 钉进 env：mcp-client 会用 scrubbedParentEnv() 起子进程（环境不可假定，我们不去猜
+  // 它到底过滤了什么），所以把要用的引擎路径**显式写进配置**，不依赖继承。
+  // 路径一律双引号：Windows 盘符路径里的 ` #`、反斜杠、空格、中文在普通标量下都会被解析坏。
+  if (godotPath) lines.push('        env:', `          GODOT_MCP_GODOT: ${yamlDoubleQuote(godotPath)}`);
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * 判断 patch 文件是不是「空文档」。
+ *
+ * 真实场景：全新 profile 里 `cordis.patch.yml` 的内容是 `[]`（合法的空 YAML 数组）。
+ * 旧实现只判「文本是否为空串」，于是把它当成有内容，拼成
+ * `[]\n- insert:` —— 一个 flow sequence 后面跟 block sequence，**非法 YAML**，
+ * DSH 直接起不来。这里把 `[]`、纯空白、纯注释、`---`/`null` 都视为空。
+ */
+export function isEmptyPatchDocument(text) {
+  const withoutComments = String(text ?? '')
+    .split('\n')
+    .filter(line => !/^\s*#/.test(line))
+    .join('\n');
+  const normalized = withoutComments
+    .replace(/^---\s*$/gm, '')
+    .replace(/^\.\.\.\s*$/gm, '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+  return normalized === '' || normalized === '[]' || normalized === 'null' || normalized === '~';
 }
 
 /**
@@ -68,6 +181,9 @@ export function patchPatchText(text, block) {
   if (insertIndex < 0) {
     // 注释头必须写在 `- insert:` **之后**（它缩进 4 格，是 insert 子数组里的一员）
     const addition = ['- insert:', header, block.trimEnd(), ''].join('\n');
+    // 空文档（空串 / 纯空白 / `[]` / 纯注释）直接整体替换，绝不在后面追加 ——
+    // 往 `[]` 后面接 `- insert:` 会写出非法 YAML。
+    if (isEmptyPatchDocument(text)) return { text: addition, action: 'created-insert' };
     const base = text.replace(/\s*$/, '');
     return { text: base.length ? `${base}\n${addition}` : addition, action: 'created-insert' };
   }
@@ -111,38 +227,64 @@ export function patchPatchText(text, block) {
 
 /**
  * 结构自检：确认文本里确实有指向本仓库、且关键字段齐全的条目。
- * 不依赖 YAML 解析器（仓库存放时零依赖），但会检查缩进与字段。
+ *
+ * 这里的判定**基于解析结果**（{@link parseEntryLoose}），不是基于「行首是不是斜杠」
+ * 之类的正则 —— 旧实现要求 command 以 `/` 开头，于是完全正常的
+ * `C:\Program Files\nodejs\node.exe` 会被判成「缺 command」，直接把 Windows 上的
+ * 自动接线挡死。解析器与真实 YAML 读取保持一致（我们只写双引号风格标量），
+ * 自检结论才等于 DSH 实际加载到的东西。
+ *
  * @param {string} text
  * @returns {{ok: boolean, problems: string[]}}
  */
-export function validatePatchText(text) {  const lines = text.split('\n');
+export function validatePatchText(text) {
+  const lines = String(text ?? '').split('\n');
   const problems = [];
   const insertIndex = lines.findIndex(line => /^- insert:\s*$/.test(line));
   if (insertIndex < 0) problems.push('缺少顶层 `- insert:`');
-  const entryIndex = lines.findIndex(line => new RegExp(`^ {4}- id: ${ENTRY_ID}\\s*$`).test(line));
-  if (entryIndex < 0) problems.push(`缺少条目 ${ENTRY_ID}（或缩进不是 4 格）`);
-  const slice = entryIndex >= 0 ? lines.slice(entryIndex, entryIndex + 14).join('\n') : '';
-  for (const [label, pattern] of [
-    ['name', new RegExp(`^ {6}name: "?${CLIENT_PACKAGE.replace(/[/@]/g, m => `\\${m}`)}"?`, 'm')],
-    ['serverName', new RegExp(`^ {8}serverName: ${SERVER_NAME}$`, 'm')],
-    ['transport', /^ {8}transport: stdio$/m],
-    ['command', /^ {8}command: \//m],
-    ['args', /^ {8}args:$/m],
-    ['toolCallTimeoutMs', /^ {8}toolCallTimeoutMs: \d+$/m],
-  ]) {
-    if (!pattern.test(slice)) problems.push(`条目里缺 ${label}（或缩进不对）`);
+  const indented = lines.findIndex(line => new RegExp(`^ {4}- id: ${ENTRY_ID}\\s*$`).test(line));
+  if (indented < 0) problems.push(`缺少条目 ${ENTRY_ID}（或缩进不是 4 格）`);
+
+  const entry = parseEntryLoose(text);
+  if (!entry) {
+    return { ok: false, problems };
+  }
+  const config = { ...(entry.config ?? entry) };
+  const push = message => { if (!problems.includes(message)) problems.push(message); };
+  if (entry.name !== CLIENT_PACKAGE) push(`name 不是 ${CLIENT_PACKAGE}（读到 ${JSON.stringify(entry.name)}）`);
+  if (config.serverName !== SERVER_NAME) push(`serverName 不是 ${SERVER_NAME}`);
+  if (config.transport !== 'stdio') push('transport 不是 stdio');
+  if (!config.command) push('缺 command');
+  else if (!isAbsolutePathValue(config.command)) push(`command 不是绝对路径（读到 ${JSON.stringify(config.command)}）`);
+  const args = config.args ?? [];
+  if (!Array.isArray(args) || args.length === 0) push('args 为空');
+  else if (!args.every(isAbsolutePathValue)) push(`args 里有非绝对路径：${JSON.stringify(args)}`);
+  if (config.cwd !== undefined && !isAbsolutePathValue(config.cwd)) push(`cwd 不是绝对路径（读到 ${JSON.stringify(config.cwd)}）`);
+  if (!Number.isFinite(config.toolCallTimeoutMs)) push('toolCallTimeoutMs 不是数字');
+  if (config.env !== undefined) {
+    for (const [key, value] of Object.entries(config.env)) {
+      if (key === 'GODOT_MCP_GODOT' && !isAbsolutePathValue(value)) push(`env.GODOT_MCP_GODOT 不是绝对路径（读到 ${JSON.stringify(value)}）`);
+    }
   }
   return { ok: problems.length === 0, problems };
 }
 
 /**
- * 没有 YAML 解析器时的兜底读取：只按缩进取本条目里我们关心的那几个标量/列表项。
+ * 没有 YAML 解析器时的兜底读取：按缩进取本条目里我们关心的那些标量与列表项。
  * 比真正的解析器弱，但足以让自检在「全新 profile 还没有 node_modules」时也能跑完。
+ *
+ * 标量统一交给 {@link decodeYamlScalar}：本仓库写出去的永远是双引号风格，
+ * 因此兜底解析结果必须与真实 YAML 解析器**逐字符一致**（旧实现只剥首尾引号，
+ * `C:\DSH #1\…` 在真解析器里是 `C:\DSH`，在兜底解析器里却还是完整字符串，
+ * 于是自检说「没问题」而 DSH 实际加载到的是错的）。
+ *
+ * 返回值既保留扁平字段（旧调用方），也提供 `config` 子对象。
+ *
  * @param {string} text
- * @returns {{id: string, name?: string, serverName?: string, transport?: string, command?: string, args: string[], cwd?: string, toolCallTimeoutMs?: number, env?: Record<string,string>}|undefined}
+ * @returns {{id: string, name?: string, serverName?: string, transport?: string, command?: string, args: string[], cwd?: string, toolCallTimeoutMs?: number, env?: Record<string,string>, config?: object}|undefined}
  */
 export function parseEntryLoose(text) {
-  const lines = text.split('\n');
+  const lines = String(text ?? '').split('\n');
   const start = lines.findIndex(line => new RegExp(`^ {4}- id: ${ENTRY_ID}\\s*$`).test(line));
   if (start < 0) return undefined;
 
@@ -151,6 +293,7 @@ export function parseEntryLoose(text) {
   while (end < lines.length && !/^ {4}- /.test(lines[end])) end += 1;
 
   const entry = { id: ENTRY_ID, args: [] };
+  const config = { args: [] };
   let section = '';
   for (const raw of lines.slice(start + 1, end)) {
     const line = raw.replace(/\s+$/, '');
@@ -160,6 +303,7 @@ export function parseEntryLoose(text) {
     if (indent === 8 && body === 'env:') {
       section = 'env';
       entry.env = {};
+      config.env = {};
       continue;
     }
     if (indent === 8 && body === 'args:') {
@@ -167,25 +311,38 @@ export function parseEntryLoose(text) {
       continue;
     }
     if (indent === 10 && section === 'args' && body.startsWith('- ')) {
-      entry.args.push(body.slice(2).trim());
+      const value = decodeYamlScalar(body.slice(2));
+      entry.args.push(value);
+      config.args.push(value);
       continue;
     }
     if (indent === 10 && section === 'env' && body.includes(':')) {
-      const [key, ...rest] = body.split(':');
-      entry.env[key.trim()] = rest.join(':').trim();
+      const colon = body.indexOf(':');
+      const key = body.slice(0, colon).trim();
+      const value = decodeYamlScalar(body.slice(colon + 1));
+      entry.env[key] = value;
+      config.env[key] = value;
       continue;
     }
     if (indent === 6 || indent === 8) section = '';
     const match = /^([A-Za-z][A-Za-z0-9_]*):\s*(.*)$/.exec(body);
     if (!match) continue;
-    const [, key, value] = match;
-    const clean = value.replace(/^["']|["']$/g, '');
-    if (indent === 6 && key === 'name') entry.name = clean;
-    if (indent === 8 && key === 'serverName') entry.serverName = clean;
-    if (indent === 8 && key === 'transport') entry.transport = clean;
-    if (indent === 8 && key === 'command') entry.command = clean;
-    if (indent === 8 && key === 'cwd') entry.cwd = clean;
-    if (indent === 8 && key === 'toolCallTimeoutMs') entry.toolCallTimeoutMs = Number(clean);
+    const [, key, rest] = match;
+    if (indent === 6 && key === 'name') entry.name = decodeYamlScalar(rest);
+    if (indent === 6 && key === 'config') continue;
+    if (indent === 8) {
+      const value = decodeYamlScalar(rest);
+      if (key === 'serverName') { entry.serverName = value; config.serverName = value; }
+      if (key === 'transport') { entry.transport = value; config.transport = value; }
+      if (key === 'command') { entry.command = value; config.command = value; }
+      if (key === 'cwd') { entry.cwd = value; config.cwd = value; }
+      if (key === 'toolCallTimeoutMs') {
+        const number = Number(value);
+        entry.toolCallTimeoutMs = number;
+        config.toolCallTimeoutMs = number;
+      }
+    }
   }
+  entry.config = config;
   return entry;
 }
