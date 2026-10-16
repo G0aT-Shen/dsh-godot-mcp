@@ -148,16 +148,55 @@ test('helper：超时会杀掉整棵子树（子进程与孙进程都不留）',
 
 test('helper：外层被强杀时，父进程看门狗回收子树（不留孤儿）', async t => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'gmcp-orphan-'));
-  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   const pidFile = path.join(dir, 'pids.json');
+  const middleStatePath = path.join(dir, 'middle.json');
+  // 单一清理钩子（合并原来的 rm 钩子）：**先读本任务写出的 pid 文件、再杀、最后才删目录**。
+  // 顺序是必须的：如果测试在 `waitFor` / 读 middle.json 阶段就失败（还没把 helper 登记进
+  // 已知集合），而 helper 在 Windows 上是 detached（已脱离 middle Node 的 libuv job），
+  // 先删目录再读就再也拿不到它的 pid —— 会留下孤儿进程。这里只读本用例自己的两个文件、
+  // 只杀这些 pid，不做任何全局匹配。
+  const treePids = new Set();
+  let middlePid;
+  t.after(async () => {
+    try {
+      const info = JSON.parse(await fsp.readFile(middleStatePath, 'utf8'));
+      if (Number.isInteger(info?.helper)) treePids.add(info.helper);
+    } catch { /* 还没写出来 */ }
+    try {
+      const info = JSON.parse(await fsp.readFile(pidFile, 'utf8'));
+      for (const key of ['child', 'grandchild']) {
+        if (Number.isInteger(info?.[key])) treePids.add(info[key]);
+      }
+    } catch { /* 还没写出来 */ }
+    if (Number.isInteger(middlePid)) treePids.add(middlePid);
+    for (const pid of treePids) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* 已退出 */ }
+    }
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && [...treePids].some(pid => isAlive(pid))) {
+      await delay(50);
+    }
+    await fsp.rm(dir, { recursive: true, force: true });
+  });
   const inner = 'const {spawn}=require("node:child_process");const fs=require("node:fs");'
     + 'const g=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",detached:false});'
     + 'fs.writeFileSync(process.argv[1],JSON.stringify({child:process.pid,grandchild:g.pid}));'
     + 'setInterval(()=>{},1000);';
 
   // middle 是 helper 的父进程；我们对 middle 直接 SIGKILL，模拟外层 Godot 被强杀。
+  //
+  // Windows 上必须让 helper `detached: true`：libuv 的 uv_spawn 会把**非 detached** 子进程
+  // AssignProcessToJobObject 到父 Node 进程的全局 job（limit 含 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE，
+  // 见官方 src/win/process.c 的 uv__init_global_job_handle 与 "assign to the global job object so
+  // windows will kill it when the parent process dies"）。父 Node 一被杀，job 句柄关闭，helper
+  // 会被系统连带杀掉 —— watchdog 根本没机会运行，也就永远不会有结果文件。
+  // 生产的 helper 由 Godot 的 OS.create_process 启动（Godot 是原生进程，不是 libuv 父），
+  // 不受这条语义影响；因此这里在 Windows 上用 detached 让 helper 脱离该 job，忠实模拟生产。
+  // POSIX 不涉及 job object，保持原样（detached:false），避免改变既有行为。
+  const helperDetached = process.platform === 'win32';
   const middleScript = 'const {spawn}=require("node:child_process");const fs=require("node:fs");'
-    + 'const h=spawn(process.execPath,[process.argv[1],process.argv[2]],{stdio:"ignore"});'
+    + `const h=spawn(process.execPath,[process.argv[1],process.argv[2]],{stdio:"ignore",detached:${helperDetached}});`
+    + 'if (typeof h.unref === "function") h.unref();'
     + 'fs.writeFileSync(process.argv[3],JSON.stringify({helper:h.pid}));setInterval(()=>{},1000);';
   const reqPath = path.join(dir, 'req.json');
   const outPath = path.join(dir, 'out.txt');
@@ -174,15 +213,22 @@ test('helper：外层被强杀时，父进程看门狗回收子树（不留孤�
     // 诊断是 opt-in：测试显式要求，生产路径默认不产生 sidecar
     diagPath,
   }));
-  const middle = spawn(process.execPath, ['-e', middleScript, HELPER, reqPath, path.join(dir, 'middle.json')], { stdio: 'ignore' });
-  t.after(() => { try { process.kill(middle.pid, 'SIGKILL'); } catch { /* 已退出 */ } });
+  const middle = spawn(process.execPath, ['-e', middleScript, HELPER, reqPath, middleStatePath], { stdio: 'ignore' });
+  middlePid = middle.pid;
+  treePids.add(middle.pid);
 
   const nested = await waitFor(async () => {
     try { return JSON.parse(await fsp.readFile(pidFile, 'utf8')); } catch { return undefined; }
   }, { timeoutMs: 15_000, label: '嵌套子进程 pid' });
   assert.ok(nested?.grandchild > 0, '嵌套孙进程必须已经起来');
 
-  process.kill(middle.pid, 'SIGKILL'); // 强杀 helper 的父进程
+  const helperPid = Number(JSON.parse(await fsp.readFile(middleStatePath, 'utf8')).helper);
+  assert.ok(Number.isInteger(helperPid) && helperPid > 0, '必须记录 helper 的 pid');
+  treePids.add(helperPid);
+  treePids.add(nested.child);
+  treePids.add(nested.grandchild);
+
+  process.kill(middle.pid, 'SIGKILL'); // 强杀 helper 的父进程（只杀这一个 pid）
   // 失败路径也必须把诊断带出来：`waitFor` 超时会直接 assert.fail 抛异常，
   // `dead()` 也会抛 —— 所以整段用 try/finally 包住，在 finally 里读 JSONL 并用
   // t.diagnostic 打进 unit.log（finally 先于 t.after 执行，那时临时目录还在）。
@@ -202,6 +248,10 @@ test('helper：外层被强杀时，父进程看门狗回收子树（不留孤�
     }, { timeoutMs: 15_000, label: '父进程消失后的 helper 结果文件' });
     assert.equal(result.orphaned, true, '结果文件必须记录「父进程消失」这一原因');
     assert.equal(result.stillRunning, undefined, '子树必须真的已经结束');
+    // helper 自己必须已经退出（结果先落盘、再退出，所以这里应当是死的）
+    const helperGone = await waitFor(() => !isAlive(helperPid), { timeoutMs: 10_000 });
+    assert.equal(helperGone, true, `helper（pid ${helperPid}）必须已退出`);
+
   } finally {
     // 无论成功、断言失败还是 waitFor 超时，都把 helper 的事件诊断原样输出到 unit.log
     const diagForLog = await fsp.readFile(diagPath, 'utf8').catch(() => '(没有 diag 文件：helper 可能从未启动或过早退出)');
@@ -217,6 +267,8 @@ test('helper：外层被强杀时，父进程看门狗回收子树（不留孤�
   }
   const startEvent = events.find(event => event.kind === 'start');
   assert.equal(startEvent.parentPid, middle.pid, `start 事件必须记录父 pid：${JSON.stringify(startEvent)}`);
+  // 诊断里的 start.helperPid 必须与 fixture 记录的一致（防止张冠李戴）
+  assert.equal(Number(startEvent.helperPid), helperPid, `start 事件里的 helper pid 必须一致：${JSON.stringify(startEvent)}`);
   const parentGone = events.find(event => event.kind === 'parent-gone');
   assert.ok(['ppid-changed', 'parent-not-alive'].includes(parentGone.branch), `parent-gone 必须说明分支：${JSON.stringify(parentGone)}`);
   assert.equal(typeof records.find(record => record.event.kind === 'result-written').t, 'number', '结果落盘必须有时间戳');
