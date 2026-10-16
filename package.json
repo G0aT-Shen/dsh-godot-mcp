@@ -23,7 +23,7 @@
   },
   "scripts": {
     "setup": "node scripts/setup.mjs",
-    "test": "node --test test/unit.test.mjs test/plugin.test.mjs test/setup.test.mjs",
+    "test": "node --test test/unit.test.mjs test/plugin.test.mjs test/setup.test.mjs test/lifecycle.test.mjs",
     "verify": "node scripts/verify-e2e.mjs",
     "verify:mcp": "node scripts/verify-mcp.mjs",
     "verify:wiring": "node scripts/verify-wiring.mjs",

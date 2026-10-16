@@ -18,9 +18,9 @@ const text = value => (typeof value === 'string' ? value : JSON.stringify(value,
 /**
  * 处理一条 JSON-RPC 消息。导出供测试直接调用。
  * @param {object} message
- * @param {{controller: GodotController, notify?: Function}} context
+ * @param {{controller: GodotController, notify?: Function, signal?: AbortSignal}} context
  */
-export async function handleMessage(message, { controller, notify = () => {} } = {}) {
+export async function handleMessage(message, { controller, notify = () => {}, signal } = {}) {
   const { id, method, params } = message ?? {};
   const reply = result => ({ jsonrpc: '2.0', id, result });
   const fail = (code, message_) => ({ jsonrpc: '2.0', id, error: { code, message: message_ } });
@@ -51,20 +51,24 @@ export async function handleMessage(message, { controller, notify = () => {} } =
       const missing = (tool.inputSchema.required ?? []).filter(key => args[key] === undefined);
       if (missing.length) return fail(-32602, `Missing required argument(s): ${missing.join(', ')}`);
       const progressToken = params?._meta?.progressToken;
+      let completed = 0;
       const progress = message_ => {
-        if (progressToken === undefined) return;
+        if (progressToken === undefined || signal?.aborted) return;
         notify({
           jsonrpc: '2.0',
           method: 'notifications/progress',
-          params: { progressToken, progress: Date.now() % 1e9, message: message_ },
+          params: { progressToken, progress: ++completed, message: message_ },
         });
       };
       try {
+        if (signal?.aborted) return null;
         progress(`${tool.name} 开始`);
-        const value = await tool.handler(args, {});
+        const value = await tool.handler(args, { signal });
+        if (signal?.aborted) return null;
         progress(`${tool.name} 完成`);
         return reply({ content: [{ type: 'text', text: text(value) }], isError: value?.ok === false });
       } catch (error) {
+        if (signal?.aborted) return null;
         return reply({ content: [{ type: 'text', text: `Error: ${error?.message ?? error}` }], isError: true });
       }
     }
@@ -87,37 +91,82 @@ export async function startMcpServer(options = {}) {
     if (message) output.write(`${JSON.stringify(message)}\n`);
   };
   const notify = message => output.write(`${JSON.stringify(message)}\n`);
+  const requests = new Map();
+  const tasks = new Set();
+  let toolQueue = Promise.resolve();
+
+  const cancelAll = () => {
+    for (const request of requests.values()) request.abort();
+  };
+  const dispatch = message => {
+    if (!message || typeof message !== 'object' || Array.isArray(message) ||
+        message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
+      send({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+      return;
+    }
+    if (message.method === 'notifications/cancelled') {
+      requests.get(message.params?.requestId)?.abort(message.params?.reason);
+      return;
+    }
+    // 其他通知不能产生响应，也不能以 tools/call 通知的方式产生副作用。
+    if (message.id === undefined) return;
+    if (requests.has(message.id)) {
+      send({ jsonrpc: '2.0', id: message.id, error: { code: -32600, message: 'Request id is already in use' } });
+      return;
+    }
+    const request = new AbortController();
+    requests.set(message.id, request);
+    const execute = async () => {
+      if (request.signal.aborted) return;
+      const result = await handleMessage(message, { controller, notify, signal: request.signal });
+      if (!request.signal.aborted) send(result);
+    };
+    // 保留写操作的串行语义；ping、发现和只读自检不排在长任务后面。
+    const queued = message.method === 'tools/call' && message.params?.name !== 'godot_status';
+    const task = (queued ? toolQueue.then(execute) : execute())
+      .catch(error => {
+        if (!request.signal.aborted) send({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: String(error?.message ?? error) } });
+      })
+      .finally(() => { requests.delete(message.id); tasks.delete(task); });
+    tasks.add(task);
+    if (queued) toolQueue = task;
+  };
 
   input.setEncoding?.('utf8');
   const shutdown = async () => {
+    cancelAll();
+    await Promise.allSettled([...tasks]);
     await controller.shutdown().catch(() => {});
     process.exit(0);
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 
-  for await (const chunk of input) {
-    buffer += chunk;
-    let newline;
-    while ((newline = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
-      if (!line) continue;
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
-        continue;
-      }
-      try {
-        send(await handleMessage(message, { controller, notify }));
-      } catch (error) {
-        send({ jsonrpc: '2.0', id: message?.id ?? null, error: { code: -32603, message: String(error?.message ?? error) } });
+  try {
+    for await (const chunk of input) {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+          continue;
+        }
+        dispatch(message);
       }
     }
+  } finally {
+    cancelAll();
+    await Promise.allSettled([...tasks]);
+    await controller.shutdown().catch(() => {});
+    process.removeListener('SIGINT', shutdown);
+    process.removeListener('SIGTERM', shutdown);
   }
-  await controller.shutdown().catch(() => {});
   return { controller };
 }
 

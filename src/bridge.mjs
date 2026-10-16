@@ -12,6 +12,19 @@ import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_EDITOR_PORT, DEFAULT_RUNTIME_PORT } from './godot.mjs';
 
+function aborted() {
+  const error = new Error('桥调用已取消（已关闭连接；Godot 内已开始的操作不会回滚）');
+  error.code = 'ABORTED';
+  return error;
+}
+
+function cancelSocket(socket, signal, reject) {
+  const onAbort = () => { socket.destroy(); reject(aborted()); };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  socket.once('close', () => signal?.removeEventListener('abort', onAbort));
+  if (signal?.aborted) onAbort();
+}
+
 /** 极简 WebSocket 客户端（只支持我们需要的：客户端发文本帧、服务端回文本帧）。 */
 class MiniWebSocket {
   constructor(socket) {
@@ -159,7 +172,8 @@ class MiniWebSocket {
  * @param {{host?: string, port?: number, timeoutMs?: number}} [options]
  * @returns {Promise<MiniWebSocket>}
  */
-function connectWebSocket({ host = '127.0.0.1', port = DEFAULT_EDITOR_PORT, timeoutMs = 5000 } = {}) {
+function connectWebSocket({ host = '127.0.0.1', port = DEFAULT_EDITOR_PORT, timeoutMs = 5000, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(aborted());
   return new Promise((resolve, reject) => {
     const key = Buffer.from(randomUUID().replace(/-/g, ''), 'hex').toString('base64');
     const socket = net.connect({ host, port });
@@ -168,6 +182,11 @@ function connectWebSocket({ host = '127.0.0.1', port = DEFAULT_EDITOR_PORT, time
       socket.destroy();
       reject(new Error(`连接编辑器桥 ${host}:${port} 超时（${timeoutMs}ms）`));
     }, timeoutMs);
+    cancelSocket(socket, signal, reject);
+    socket.once('close', () => {
+      clearTimeout(timer);
+      reject(signal?.aborted ? aborted() : new Error('编辑器桥连接已关闭'));
+    });
 
     const onData = chunk => {
       handshake = Buffer.concat([handshake, chunk]);
@@ -244,19 +263,28 @@ export async function callEditor(op, params = {}, options = {}) {
       }
       return message.data ?? null;
     }
+  } catch (error) {
+    if (options.signal?.aborted) throw aborted();
+    throw error;
   } finally {
     ws.destroy();
   }
 }
 
 /** 极简 TCP 行分隔 JSON 客户端。 */
-function connectTcp({ host = '127.0.0.1', port = DEFAULT_RUNTIME_PORT, timeoutMs = 5000 } = {}) {
+function connectTcp({ host = '127.0.0.1', port = DEFAULT_RUNTIME_PORT, timeoutMs = 5000, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(aborted());
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host, port });
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new Error(`连接运行时桥 ${host}:${port} 超时（${timeoutMs}ms）`));
     }, timeoutMs);
+    cancelSocket(socket, signal, reject);
+    socket.once('close', () => {
+      clearTimeout(timer);
+      reject(signal?.aborted ? aborted() : new Error('运行时桥连接已关闭'));
+    });
     socket.once('error', error => {
       clearTimeout(timer);
       reject(new Error(`连接运行时桥 ${host}:${port} 失败：${error.message}`));
@@ -266,6 +294,11 @@ function connectTcp({ host = '127.0.0.1', port = DEFAULT_RUNTIME_PORT, timeoutMs
       let buffer = '';
       const queue = [];
       const waiters = [];
+      let closedError;
+      socket.once('close', () => {
+        closedError = signal?.aborted ? aborted() : new Error('运行时桥连接已关闭');
+        for (const waiter of waiters.splice(0)) waiter.reject(closedError);
+      });
       socket.on('data', chunk => {
         buffer += String(chunk);
         for (;;) {
@@ -281,16 +314,19 @@ function connectTcp({ host = '127.0.0.1', port = DEFAULT_RUNTIME_PORT, timeoutMs
             continue;
           }
           const waiter = waiters.shift();
-          if (waiter) waiter(message);
+          if (waiter) waiter.resolve(message);
           else queue.push(message);
         }
       });
       resolve({
         socket,
         async request(payload, perCallTimeout) {
+          if (signal?.aborted) throw aborted();
+          if (closedError) throw closedError;
           socket.write(`${JSON.stringify(payload)}\n`);
           const deadline = Date.now() + perCallTimeout;
           for (;;) {
+            if (closedError) throw closedError;
             let message;
             if (queue.length) {
               message = queue.shift();
@@ -298,16 +334,16 @@ function connectTcp({ host = '127.0.0.1', port = DEFAULT_RUNTIME_PORT, timeoutMs
               const remaining = deadline - Date.now();
               if (remaining <= 0) throw new Error(`等待运行时响应超时（${perCallTimeout}ms）`);
               message = await new Promise((res, rej) => {
-                const entry = res;
+                const entry = {
+                  resolve: value => { clearTimeout(t); res(value); },
+                  reject: error => { clearTimeout(t); rej(error); },
+                };
                 const t = setTimeout(() => {
                   const index = waiters.indexOf(entry);
                   if (index !== -1) waiters.splice(index, 1);
                   rej(new Error(`等待运行时响应超时（${perCallTimeout}ms）`));
                 }, remaining);
-                waiters.push(value => {
-                  clearTimeout(t);
-                  res(value);
-                });
+                waiters.push(entry);
               });
             }
             if (message.id === payload.id) return message;

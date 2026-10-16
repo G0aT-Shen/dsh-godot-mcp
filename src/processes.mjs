@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { godotPath, resolveProject } from './godot.mjs';
-import { hasInstalledBridge, injectTransientBridge, restoreTransientBridge, sweepStaleInjections } from './inject.mjs';
+import { hasInstalledBridge, injectTransientBridge, restoreTransientBridge, pendingInjections } from './inject.mjs';
 
 /** 防止长驻会话被系统休眠/节流冻结；不存在就安静降级。 */
 const CAFFEINATE = '/usr/bin/caffeinate';
@@ -145,6 +145,7 @@ class ManagedProcess extends EventEmitter {
       stdoutBytes: this.stdout.length,
       stderrBytes: this.stderr.length,
       truncated: this.truncated,
+      ...(this.cleanupError ? { cleanupError: this.cleanupError } : {}),
     };
   }
 }
@@ -155,6 +156,42 @@ export class ProcessRegistry {
     this.processes = new Map();
     /** attach 模式：只注入桥、不持有进程。 */
     this.attached = new Map();
+    this.transientBridges = new Map();
+    this.projectTasks = new Map();
+  }
+
+  #withProject(projectPath, action) {
+    const previous = this.projectTasks.get(projectPath) ?? Promise.resolve();
+    const task = previous.catch(() => {}).then(action);
+    this.projectTasks.set(projectPath, task);
+    const release = () => {
+      if (this.projectTasks.get(projectPath) === task) this.projectTasks.delete(projectPath);
+    };
+    task.then(release, release);
+    return task;
+  }
+
+  #projectActive(projectPath) {
+    return [...this.processes.values()].some(p => p.kind === 'game' && p.running && p.projectPath === projectPath) ||
+      [...this.attached.values()].some(entry => entry.projectPath === projectPath);
+  }
+
+  async #prepareBridge(projectPath, options) {
+    const current = this.transientBridges.get(projectPath);
+    if (current && !['none', 'installed'].includes(options.bridge)) {
+      return { ...current, injected: false, shared: true };
+    }
+    const bridge = await prepareBridge(projectPath, options);
+    if (bridge.mode === 'transient') this.transientBridges.set(projectPath, bridge);
+    return bridge;
+  }
+
+  async #cleanupProject(projectPath, untracked = false) {
+    if (!this.transientBridges.has(projectPath) && !untracked) return undefined;
+    if (this.#projectActive(projectPath)) return { deferred: true, reason: 'project-in-use' };
+    const result = await restoreTransientBridge(projectPath);
+    this.transientBridges.delete(projectPath);
+    return result;
   }
 
   /**
@@ -194,15 +231,17 @@ export class ProcessRegistry {
       defaultProject: options.defaultProject,
     });
     const binary = requireGodot(options.godot);
-    const bridge = await prepareBridge(projectPath, options);
-    const args = [];
-    if (options.headless) args.push('--headless');
-    args.push('--path', projectPath);
-    if (options.scene) args.push(options.scene);
-    args.push(...(options.extraArgs ?? []));
-    const process_ = this.#spawn('game', binary, args, projectPath, options.keepAwake);
-    process_.bridge = bridge;
-    return process_;
+    return this.#withProject(projectPath, async () => {
+      const bridge = await this.#prepareBridge(projectPath, options);
+      const args = [];
+      if (options.headless) args.push('--headless');
+      args.push('--path', projectPath);
+      if (options.scene) args.push(options.scene);
+      args.push(...(options.extraArgs ?? []));
+      const process_ = this.#spawn('game', binary, args, projectPath, options.keepAwake);
+      process_.bridge = bridge;
+      return process_;
+    });
   }
 
   /**
@@ -210,36 +249,39 @@ export class ProcessRegistry {
    * （CI、手动 `godot --path .`、外部调试器）但你仍然想用运行时工具的场景。
    */
   async attach(projectPath, options = {}) {
-    const bridge = await prepareBridge(projectPath, { ...options, bridge: options.bridge ?? 'transient' });
-    const id = `attached-${randomUUID().slice(0, 8)}`;
-    this.attached.set(id, {
-      id,
-      kind: 'attached',
-      projectPath,
-      bridge,
-      startedAt: Date.now(),
+    return this.#withProject(projectPath, async () => {
+      const bridge = await this.#prepareBridge(projectPath, { ...options, bridge: options.bridge ?? 'transient' });
+      const id = `attached-${randomUUID().slice(0, 8)}`;
+      this.attached.set(id, { id, kind: 'attached', projectPath, bridge, startedAt: Date.now() });
+      return { id, bridge, projectPath };
     });
-    return { id, bridge, projectPath };
   }
 
   /** 撤销 attach（等价于对它做 stop）。 */
   async detach(id, projectPath) {
     const entry = id ? this.attached.get(id) : undefined;
-    if (entry) {
-      this.attached.delete(entry.id);
-      return { id: entry.id, projectPath: entry.projectPath, ...(await restoreTransientBridge(entry.projectPath)) };
-    }
-    if (projectPath) return { projectPath, ...(await restoreTransientBridge(projectPath)) };
-    return undefined;
+    const project = entry?.projectPath ?? projectPath;
+    if (!project) return undefined;
+    return this.#withProject(project, async () => {
+      if (entry) this.attached.delete(entry.id);
+      else for (const [key, value] of this.attached) {
+        if (value.projectPath === project) this.attached.delete(key);
+      }
+      return { ...(entry ? { id: entry.id } : {}), projectPath: project, ...(await this.#cleanupProject(project, true)) };
+    });
   }
 
   /** 回收「记录里还有、但已无活跃会话」的注入（MCP 被杀之后留下的残留）。 */
   async sweepInjections() {
-    const liveProjects = new Set(
-      [...this.processes.values()].filter(process_ => process_.running).map(process_ => process_.projectPath),
-    );
-    for (const entry of this.attached.values()) liveProjects.add(entry.projectPath);
-    return sweepStaleInjections({ isActive: project => liveProjects.has(project) });
+    const swept = [];
+    for (const entry of await pendingInjections()) {
+      const report = await this.#withProject(entry.project, async () => {
+        if (this.#projectActive(entry.project)) return undefined;
+        return { project: entry.project, cleaned: true, ...(await this.#cleanupProject(entry.project, true)) };
+      });
+      if (report) swept.push(report);
+    }
+    return swept;
   }
 
   #spawn(kind, binary, args, projectPath, keepAwake) {
@@ -258,6 +300,11 @@ export class ProcessRegistry {
     }).start();
     this.processes.set(id, process_);
     process_.on('exit', () => {
+      // 退出事件同步登记 Promise：stop(id/kind) 可等待同一份清理，不会重复恢复。
+      if (kind === 'game') {
+        process_.bridgeCleanup = this.#withProject(projectPath, () => this.#cleanupProject(projectPath));
+        process_.bridgeCleanup.catch(error => { process_.cleanupError = String(error?.message ?? error); });
+      }
       // 保留记录以便查询退出码与日志；上限 50 条防止无限增长。
       if (this.processes.size > 50) {
         for (const [key, value] of this.processes) {
@@ -320,7 +367,7 @@ export class ProcessRegistry {
       return undefined;
     }
     const result = await process_.stop(options);
-    const cleanup = await cleanupBridge(process_);
+    const cleanup = await process_.bridgeCleanup;
     return cleanup ? { ...result, bridgeCleanup: cleanup } : result;
   }
 
@@ -328,9 +375,7 @@ export class ProcessRegistry {
     const attachedIds = [...this.attached.keys()];
     const results = await Promise.all([
       ...[...this.processes.values()].map(async process_ => {
-        const result = await process_.stop();
-        const cleanup = await cleanupBridge(process_);
-        return { id: process_.id, ...result, ...(cleanup ? { bridgeCleanup: cleanup } : {}) };
+        return { id: process_.id, ...(await this.stop(process_.id)) };
       }),
       ...attachedIds.map(async id => ({ id, ...(await this.detach(id)) })),
     ]);
@@ -356,19 +401,6 @@ async function prepareBridge(projectPath, options = {}) {
   }
   const report = await injectTransientBridge(projectPath, { port: options.runtimePort });
   return { mode: 'transient', transientProject: projectPath, ...report };
-}
-
-/** 会话结束后把零足迹注入撤掉。只有注入过的会话才需要。 */
-async function cleanupBridge(process_) {
-  if (process_?.bridge?.mode !== 'transient' || !process_.bridge.transientProject) return undefined;
-  try {
-    const result = await restoreTransientBridge(process_.bridge.transientProject);
-    // 清一次就不再重复清，避免 stopAll 之类重复路径留下误导性的第二次结果
-    process_.bridge.transientProject = undefined;
-    return result;
-  } catch (error) {
-    return { error: String(error?.message ?? error) };
-  }
 }
 
 function requireGodot(hint) {

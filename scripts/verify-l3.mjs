@@ -501,6 +501,27 @@ async function main() {
     JSON.stringify((await fsp.readdir(cleanDir)).sort()),
   );
 
+  process.stdout.write('\n=== 注入生命周期回归 ===\n');
+  const ownOverride = '[application]\n\nconfig/name="UserOverride"\n';
+  await fsp.writeFile(overridePath, ownOverride);
+  const exitingSession = await controller.session('game', { project: cleanDir, headless });
+  if (!exitingSession.ok) throw new Error(exitingSession.error);
+  await waitForPort(9091, 60_000);
+  const naturalQuit = await controller.bridge('runtime', 'rt.quit', {});
+  const exitingProcess = controller.processes.get(exitingSession.session.id);
+  const exitDeadline = Date.now() + 10_000;
+  while (exitingProcess.running && Date.now() < exitDeadline) await sleep(25);
+  await exitingProcess.bridgeCleanup;
+  record('自然退出无需 stop 就清理运行时脚本', naturalQuit.ok && !exitingProcess.running && !existsSync(scriptPath));
+  record('自然退出后用户 override.cfg 逐字节还原', (await fsp.readFile(overridePath, 'utf8')) === ownOverride);
+
+  const kindSession = await controller.session('game', { project: cleanDir, headless });
+  if (!kindSession.ok) throw new Error(kindSession.error);
+  await waitForPort(9091, 60_000);
+  const kindStop = await controller.session('stop', { kind: 'game' });
+  record('按 kind 停止也等待注入清理', kindStop.ok && !existsSync(scriptPath) && !controller.processes.get(kindSession.session.id).running);
+  record('重复启动并按 kind 停止后用户配置仍完整', (await fsp.readFile(overridePath, 'utf8')) === ownOverride);
+
   // ---------------------------------------------------------------- attach / detach
   //
   // 场景：游戏不是你启动的（CI、手动 godot --path .、外部调试器）。

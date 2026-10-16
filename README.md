@@ -81,6 +81,19 @@ GitHub 上已有 30+ 个 Godot MCP 项目，但都不适合直接用在 DSH 里�
 - **逃生舱**：每层都有执行任意 GDScript 的能力（`gdscript` / `editor.execute` / `rt.eval`），
   所以即使某个专用 op 没实现，也不会卡住。
 
+### 会话清理与取消
+
+运行时临时注入会保留用户原有 `override.cfg` 的备份，直到最后一次清理；重复注入不会丢掉原始备份。
+同一个 server 内，同一项目的游戏与 attach 会话共享注入，最后一个会话结束后才恢复配置。
+游戏自行退出、按 id 或 kind 停止都会触发清理；显式 stop 会等待清理完成。
+自然退出后的清理失败会在会话的 `cleanupError` 中报告，可用 `godot_session(action="cleanup")` 重试。
+强杀 server 后的残留仍需 cleanup 回收。此保护范围是单个 server，多个独立 server 请使用不同项目副本。
+
+stdio MCP 会及时处理 ping、工具发现、自检和 `notifications/cancelled`，其他工具调用保持串行。
+取消排队中的请求会阻止它执行；取消 L1 操作会终止它的进程组；连接断开或 stdin EOF 也会取消待执行和正在执行的请求。
+取消 L2/L3 桥调用会立即关闭连接、停止等待，**已经在 Godot 内开始的操作不会回滚，也不保证停止**；
+脚本协程仍受引擎侧超时和看门狗约束。取消会话启动时，如果进程或 attach 已创建，会先停止并清理它。
+
 ## 安装细节
 
 ### 1. Godot 引擎

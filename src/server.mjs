@@ -183,6 +183,7 @@ export class GodotController {
         port,
         host: options.host,
         timeoutMs: options.timeoutMs,
+        signal: options.signal,
       });
       return { ok: true, target, op, data };
     } catch (error) {
@@ -193,6 +194,7 @@ export class GodotController {
   /** 长驻进程：启动/停止/日志/列表。 */
   async session(action, params = {}) {
     try {
+      params.signal?.throwIfAborted();
       const options = { ...this.baseOptions, ...params };
       switch (action) {
         case 'list':
@@ -211,10 +213,18 @@ export class GodotController {
         }
         case 'editor': {
           const process_ = await this.processes.startEditor(options);
+          if (params.signal?.aborted) {
+            await this.processes.stop(process_.id);
+            params.signal.throwIfAborted();
+          }
           return { ok: true, session: cleanJson(process_.toJSON()) };
         }
         case 'game': {
           const process_ = await this.processes.startGame(options);
+          if (params.signal?.aborted) {
+            await this.processes.stop(process_.id);
+            params.signal.throwIfAborted();
+          }
           return { ok: true, session: cleanJson(process_.toJSON()) };
         }
         case 'attach': {
@@ -227,6 +237,10 @@ export class GodotController {
           const attached = await this.processes.attach(project, {
             runtimePort: params.runtimePort ?? this.runtimePort,
           });
+          if (params.signal?.aborted) {
+            await this.processes.detach(attached.id);
+            params.signal.throwIfAborted();
+          }
           return cleanJson({
             ok: true,
             action: 'attach',
@@ -260,7 +274,7 @@ export class GodotController {
           const targets = this.processes.findRunning(kind);
           if (!targets.length) return { ok: true, stopped: [], note: '没有正在运行的会话' };
           const results = await Promise.all(
-            targets.map(process_ => process_.stop({ graceMs: params.graceMs }).then(result => ({ id: process_.id, ...result }))),
+            targets.map(process_ => this.processes.stop(process_.id, { graceMs: params.graceMs }).then(result => ({ id: process_.id, ...result }))),
           );
           return { ok: true, stopped: results };
         }

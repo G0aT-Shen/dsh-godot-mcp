@@ -22,6 +22,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { PACKAGE_ROOT } from './godot.mjs';
 import { RUNTIME_AUTOLOAD_NAME, RUNTIME_SCRIPT_RES, upsertIniSetting } from './install.mjs';
 
@@ -96,9 +97,9 @@ export async function transientState(projectPath) {
 
 // ------------------------------------------------------------------ 状态文件
 
-async function readState() {
+async function readState(file = stateFile()) {
   try {
-    const raw = await fsp.readFile(stateFile(), 'utf8');
+    const raw = await fsp.readFile(file, 'utf8');
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : { projects: {} };
   } catch {
@@ -106,28 +107,44 @@ async function readState() {
   }
 }
 
-async function writeState(state) {
-  await fsp.mkdir(stateDir(), { recursive: true });
-  await fsp.writeFile(stateFile(), `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-}
-
-async function rememberProject(projectPath, entry) {
-  const state = await readState();
-  state.projects = state.projects ?? {};
-  state.projects[projectPath] = { ...entry, at: new Date().toISOString() };
-  await writeState(state);
-}
-
-async function forgetProject(projectPath) {
-  const state = await readState();
-  if (state.projects?.[projectPath]) {
-    delete state.projects[projectPath];
-    await writeState(state);
+async function writeState(file, state) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    await fsp.writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    await fsp.rename(temporary, file);
+  } finally {
+    await fsp.rm(temporary, { force: true });
   }
+}
+
+// 不同项目可同时结束；必须把整次 read/modify/write 排队，不能互相覆盖条目。
+let stateWrites = Promise.resolve();
+function updateState(change) {
+  const file = stateFile();
+  const task = stateWrites.then(async () => {
+    const state = await readState(file);
+    change(state);
+    await writeState(file, state);
+  });
+  stateWrites = task.catch(() => {});
+  return task;
+}
+
+function rememberProject(projectPath, entry) {
+  return updateState(state => {
+    state.projects = state.projects ?? {};
+    state.projects[projectPath] = { ...entry, at: new Date().toISOString() };
+  });
+}
+
+function forgetProject(projectPath) {
+  return updateState(state => { delete state.projects?.[projectPath]; });
 }
 
 /** 列出「状态文件里还记着」的项目——用于 MCP 重启后回收上一次的残留。 */
 export async function pendingInjections() {
+  await stateWrites;
   const state = await readState();
   return Object.entries(state.projects ?? {}).map(([project, entry]) => ({ project, ...entry }));
 }
@@ -154,7 +171,7 @@ export async function injectTransientBridge(projectPath, options = {}) {
   // 「备份文件存在」就是上次没跑完的证据 —— 这也是不用额外 marker 文件的原因。
   if (state.backupExists) {
     await fsp.copyFile(state.backupPath, state.overridePath);
-    await fsp.rm(state.backupPath, { force: true });
+    // 这份原始备份必须保留到最终清理。重复注入不是一次清理。
     recovered.restored = true;
   } else if (state.overrideExists && !state.overrideHasAutoload) {
     // 用户自己的 override.cfg，先留一份原样备份
@@ -187,7 +204,7 @@ export async function injectTransientBridge(projectPath, options = {}) {
     overridePath,
     backupPath: path.join(projectPath, OVERRIDE_BACKUP_NAME),
     scriptDir: path.join(projectPath, TRANSIENT_DIR_RELATIVE),
-    hadOwnOverride: state.overrideExists && !state.overrideHasAutoload,
+    hadOwnOverride: state.backupExists || (state.overrideExists && !state.overrideHasAutoload),
   });
 
   return {
