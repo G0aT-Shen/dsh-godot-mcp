@@ -129,26 +129,31 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Unit/lifecycle tests failed' }
 
       - name: MCP protocol integration
+        if: ${{ !cancelled() }}
         run: |
           node scripts/verify-mcp.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/mcp.log
           if ($LASTEXITCODE -ne 0) { throw 'MCP integration failed' }
 
       - name: Godot operations integration
+        if: ${{ !cancelled() }}
         run: |
           node scripts/verify-e2e.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/operations.log
           if ($LASTEXITCODE -ne 0) { throw 'Godot operations failed' }
 
       - name: Diagnostics and deep parse checks
+        if: ${{ !cancelled() }}
         run: |
           node scripts/verify-diagnostics.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/diagnostics.log
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostics integration failed' }
 
       - name: Runtime bridge and cleanup integration
+        if: ${{ !cancelled() }}
         run: |
           node scripts/verify-l3.mjs --headless 2>&1 | Tee-Object -FilePath verification/ci-logs/runtime.log
           if ($LASTEXITCODE -ne 0) { throw 'Runtime integration failed' }
 
       - name: Windows export and release bridge gate
+        if: ${{ !cancelled() }}
         run: |
           node scripts/verify-export.mjs 2>&1 | Tee-Object -FilePath verification/ci-logs/export.log
           if ($LASTEXITCODE -ne 0) { throw 'Export gate failed' }
