@@ -40,6 +40,9 @@ node scripts/setup.mjs          # 自检 + 写 DSH 接线（幂等，改动前�
 平台：**macOS 实测**（Godot 4.7.2 / Apple M1，Node 24）。Linux / Windows 的代码路径存在但**未验证**：
 `run_project` 的输出分离依赖 `/bin/sh`，桥的常驻会话用 `caffeinate` 防 App Nap（非 macOS 自动跳过）。
 
+**Windows DSH 独立使用尚未就绪**：已确认 POSIX 执行器、盘符路径校验和安装配置等兼容性阻碍，不能只换路径就交付。
+见 [Windows 兼容性检查与迁移方案](verification/WINDOWS-MIGRATION-20261016.md) 和 [当前桌面 DSH 更新及实际调用记录](verification/DSH-UPDATE-20261016.md)；本轮无 Windows 实机验证。
+
 ## 它解决什么问题
 
 GitHub 上已有 30+ 个 Godot MCP 项目，但都不适合直接用在 DSH 里：
