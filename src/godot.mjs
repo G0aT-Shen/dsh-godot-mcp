@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
-import { killTree, listDescendants } from './proc-tree.mjs';
+import { killTree, listDescendantsDetailed } from './proc-tree.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = path.resolve(HERE, '..');
@@ -538,11 +538,25 @@ export function runProcess(command, args, options = {}) {
      */
     const terminateTree = async () => {
       const pid = child.pid;
-      if (pid === undefined) return { ok: true, note: 'no-pid' };
+      if (pid === undefined) {
+        // 没有 pid 时，`closed` 只能来自真实的 'close' 事件；`exited` 用 exitCode/signalCode，
+        // 且必须写 `!= null`（未 spawn 成功时它们是 undefined，而 undefined !== null 为真，
+        // 会冒充「已经退出」）。
+        return {
+          ok: true,
+          note: 'no-pid',
+          closed,
+          exited: child.exitCode != null || child.signalCode != null,
+          survivors: [],
+        };
+      }
       // **杀前快照**：一旦开始杀，父子关系就被破坏（reparent），事后再枚举既可能漏人、
       // 也不能作为「已经回收」的证据。所以要杀的对象必须在杀之前就确定下来。
-      const snapshot = process.platform === 'win32' ? [] : listDescendants(pid);
-      const targets = [pid, ...snapshot];
+      // Windows 上也必须快照：taskkill /T 只覆盖「当时还在关系树里」的后代，
+      // 而且没有快照就无法逐个确认它们真的退出了（之前 win32 直接跳过 → 漏孙进程）。
+      // 快照来源与是否可信**如实回传**（CIM 查询失败/空输出时为 ok:false，不许静默当成空树）。
+      const snapshotInfo = listDescendantsDetailed(pid);
+      const targets = [pid, ...snapshotInfo.descendants];
       const kill = await killTree(pid, { force: true });
       // 有界等待「快照里的每一个 pid」都消失，而不是看进程组或事后枚举
       const deadline = Date.now() + 8000;
@@ -577,8 +591,29 @@ export function runProcess(command, args, options = {}) {
         }
         if (running) survivors.push(target);
       }
+      // **close 事件才是「进程真的结束了」的证据**：pid 从 process.kill(pid,0) 上消失
+      // 不等于 Node 已经派发过 'close'。Windows 上 taskkill 干掉进程后 pid 立刻查不到，
+      // 而 'close' 要等下一个事件循环回合 —— 若此时直接返回，就会报 closed:false 的假信息
+      // （CI 实测：取消/超时两条路径都因此失败）。这里再有界等一次 close。
+      let observedClosed = closed;
+      if (!observedClosed) {
+        observedClosed = (await raceWithTimeout(closedPromise.then(() => true), 3000)) === true;
+      }
+      const exited = child.exitCode != null || child.signalCode != null;
       clearPendingTimers();
-      return { ...kill, pid, snapshot: targets.length, closed, survivors };
+      return {
+        ...kill,
+        pid,
+        snapshot: targets.length,
+        // 快照可信度：调用方据此判断「回收干净」这个结论有多硬
+        snapshotOk: snapshotInfo.ok,
+        snapshotSource: snapshotInfo.source,
+        snapshotMs: snapshotInfo.elapsedMs,
+        ...(snapshotInfo.error ? { snapshotError: snapshotInfo.error } : {}),
+        closed: observedClosed,
+        exited,
+        survivors,
+      };
     };
 
     const finish = (fn, value) => {

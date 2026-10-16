@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { killTree, taskkillArgs, taskkillPath, terminateTree } from '../src/proc-tree.mjs';
+import { killTree, listDescendants, taskkillArgs, taskkillPath, terminateTree } from '../src/proc-tree.mjs';
 import { runProcess } from '../src/godot.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -162,6 +162,7 @@ test('helper：外层被强杀时，父进程看门狗回收子树（不留孤�
   const reqPath = path.join(dir, 'req.json');
   const outPath = path.join(dir, 'out.txt');
   const resultPath = path.join(dir, 'result.json');
+  const diagPath = path.join(dir, 'helper.diag.jsonl');
   await fsp.writeFile(reqPath, JSON.stringify({
     exe: process.execPath,
     args: ['-e', inner, pidFile],
@@ -170,6 +171,8 @@ test('helper：外层被强杀时，父进程看门狗回收子树（不留孤�
     errPath: path.join(dir, 'err.txt'),
     resultPath,
     statusPath: path.join(dir, 'status.json'),
+    // 诊断是 opt-in：测试显式要求，生产路径默认不产生 sidecar
+    diagPath,
   }));
   const middle = spawn(process.execPath, ['-e', middleScript, HELPER, reqPath, path.join(dir, 'middle.json')], { stdio: 'ignore' });
   t.after(() => { try { process.kill(middle.pid, 'SIGKILL'); } catch { /* 已退出 */ } });
@@ -180,20 +183,43 @@ test('helper：外层被强杀时，父进程看门狗回收子树（不留孤�
   assert.ok(nested?.grandchild > 0, '嵌套孙进程必须已经起来');
 
   process.kill(middle.pid, 'SIGKILL'); // 强杀 helper 的父进程
-  await dead(nested.grandchild, '父进程消失后的孙进程');
-  await dead(nested.child, '父进程消失后的子进程');
-  // helper 只在「子树真的死掉」之后才写结果，所以这里必须等结果文件出现，
-  // 不能杀完立刻读（那会读到「还没有结果」而不是「没有清理」）。
-  const result = await waitFor(async () => {
-    try {
-      return JSON.parse(await fsp.readFile(resultPath, 'utf8'));
-    } catch {
-      return undefined;
-    }
-  }, { timeoutMs: 15_000, label: '父进程消失后的 helper 结果文件' });
-  assert.ok(result, 'helper 必须写出结果文件');
-  assert.equal(result.orphaned, true, '结果文件必须记录「父进程消失」这一原因');
-  assert.equal(result.stillRunning, undefined, '子树必须真的已经结束');
+  // 失败路径也必须把诊断带出来：`waitFor` 超时会直接 assert.fail 抛异常，
+  // `dead()` 也会抛 —— 所以整段用 try/finally 包住，在 finally 里读 JSONL 并用
+  // t.diagnostic 打进 unit.log（finally 先于 t.after 执行，那时临时目录还在）。
+  // 原先的 `if (!result)` 分支永远不可达、t.diagnostic 只在成功时打印，
+  // 于是 Windows 再次 15s 失败时**拿不到任何证据**。
+  try {
+    await dead(nested.grandchild, '父进程消失后的孙进程');
+    await dead(nested.child, '父进程消失后的子进程');
+    // helper 只在「子树真的死掉」之后才写结果，所以这里必须等结果文件出现，
+    // 不能杀完立刻读（那会读到「还没有结果」而不是「没有清理」）。
+    const result = await waitFor(async () => {
+      try {
+        return JSON.parse(await fsp.readFile(resultPath, 'utf8'));
+      } catch {
+        return undefined;
+      }
+    }, { timeoutMs: 15_000, label: '父进程消失后的 helper 结果文件' });
+    assert.equal(result.orphaned, true, '结果文件必须记录「父进程消失」这一原因');
+    assert.equal(result.stillRunning, undefined, '子树必须真的已经结束');
+  } finally {
+    // 无论成功、断言失败还是 waitFor 超时，都把 helper 的事件诊断原样输出到 unit.log
+    const diagForLog = await fsp.readFile(diagPath, 'utf8').catch(() => '(没有 diag 文件：helper 可能从未启动或过早退出)');
+    t.diagnostic(`helper 事件诊断（本任务 JSONL）：\n${diagForLog.trim()}`);
+  }
+  // 诊断本身也要可断言：关键事件缺失说明「没触发」或「没落盘」，两种都是要查的
+  const diagText = await fsp.readFile(diagPath, 'utf8').catch(() => '(没有 diag 文件)');
+  const records = diagText.trim().split('\n').map(line => JSON.parse(line));
+  const events = records.map(record => record.event);
+  const kinds = events.map(event => event.kind);
+  for (const required of ['start', 'watch-poll', 'parent-gone', 'terminate-start', 'killtree-done', 'close', 'result-written']) {
+    assert.ok(kinds.includes(required), `诊断缺少事件 ${required}：${JSON.stringify(kinds)}`);
+  }
+  const startEvent = events.find(event => event.kind === 'start');
+  assert.equal(startEvent.parentPid, middle.pid, `start 事件必须记录父 pid：${JSON.stringify(startEvent)}`);
+  const parentGone = events.find(event => event.kind === 'parent-gone');
+  assert.ok(['ppid-changed', 'parent-not-alive'].includes(parentGone.branch), `parent-gone 必须说明分支：${JSON.stringify(parentGone)}`);
+  assert.equal(typeof records.find(record => record.event.kind === 'result-written').t, 'number', '结果落盘必须有时间戳');
 });
 
 test('runProcess：取消与超时都会回收整棵子树', async t => {
@@ -419,10 +445,60 @@ test('helper kill mode：按 pid 快照整树回收（含孙进程），并写�
     assert.equal(result.ok, true);
     assert.deepEqual(result.survivors, []);
     assert.ok(result.snapshot >= 2, `快照必须包含孙进程：${JSON.stringify(result)}`);
+    assert.equal(result.snapshotOk, true, `快照必须可信（CIM 正常）：${JSON.stringify(result.snapshotReports)}`);
     await dead(pids.child, 'kill mode 的子进程');
     await dead(pids.grandchild, 'kill mode 的孙进程');
     assert.equal(fs.existsSync(requestPath), false, 'kill 请求文件也要清理');
   } finally {
     await fsp.rm(dir, { recursive: true, force: true });
   }
+});
+
+test('runProcess：超时路径也必须等到 close 事件（不能拿「pid 查不到」冒充已退出）', async () => {
+  // CI(Windows) 实测过的竞态：taskkill 之后 pid 立刻从 process.kill(pid,0) 上消失，
+  // 但 Node 还没派发 'close'；此时返回会得到 closed:false 的假信息。
+  const error = await runProcess(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { timeoutMs: 300 })
+    .then(() => undefined, err => err);
+  assert.ok(error, '必须超时失败');
+  assert.equal(error.code, 'TIMEOUT');
+  assert.equal(error.kill.closed, true, `返回时必须已经观察到 close：${JSON.stringify(error.kill)}`);
+  assert.equal(error.kill.exited, true, 'exitCode/signalCode 必须已经落地');
+  assert.deepEqual(error.kill.survivors, [], '不应有幸存者');
+  assert.ok(error.kill.snapshot >= 1, '快照必须包含根进程');
+});
+
+test('listDescendants：Windows 必须走真实 CIM（ParentProcessId），不能退回 POSIX ps', async () => {
+  // 三代进程树：100 → 200 → 300（300 是孙进程）
+  const cim = () => JSON.stringify([
+    { ProcessId: 100, ParentProcessId: 1 },
+    { ProcessId: 200, ParentProcessId: 100 },
+    { ProcessId: 300, ParentProcessId: 200 },
+    { ProcessId: 400, ParentProcessId: 1 },
+  ]);
+  const tree = listDescendants(100, { platform: 'win32', cimImpl: cim });
+  assert.deepEqual([...tree].sort((a, b) => a - b), [200, 300], `Windows 快照必须含孙进程：${JSON.stringify(tree)}`);
+  assert.equal(tree[0], 300, '顺序应当是深的在前（先杀子孙、后杀父）');
+  assert.equal(tree.includes(400), false, '不属于这棵树的进程不能被算进来');
+
+  // 明确断言 win32 下不会去用 ps：ps 故意返回一棵“错误的树”，结果必须仍以 CIM 为准
+  const ps = () => '100 1\n999 100';
+  const onlyCim = listDescendants(100, { platform: 'win32', cimImpl: cim, psImpl: ps });
+  assert.deepEqual([...onlyCim].sort((a, b) => a - b), [200, 300], 'win32 分支不得使用 ps 的输出');
+
+  // POSIX 分支仍然走 ps
+  assert.deepEqual([...listDescendants(100, { platform: 'linux', psImpl: () => '100 1\n200 100\n300 200' })].sort((a, b) => a - b), [200, 300]);
+  // CIM 不可用（查询抛错）时如实返回空树，而不是编造
+  assert.deepEqual(listDescendants(100, { platform: 'win32', cimImpl: () => { throw new Error('no powershell'); } }), []);
+  // 空输出 / 0 行同样必须**可观察地降级**，不能静默当成「确实没有后代」
+  const { listDescendantsDetailed } = await import('../src/proc-tree.mjs');
+  const emptyOut = listDescendantsDetailed(100, { platform: 'win32', cimImpl: () => '' });
+  assert.equal(emptyOut.ok, false, `空输出必须标记为不可信：${JSON.stringify(emptyOut)}`);
+  assert.match(String(emptyOut.error), /空输出/);
+  const zeroRows = listDescendantsDetailed(100, { platform: 'win32', cimImpl: () => '[]' });
+  assert.equal(zeroRows.ok, false, '0 行也必须标记为不可信');
+  const thrown = listDescendantsDetailed(100, { platform: 'win32', cimImpl: () => { throw new Error('no pwsh'); } });
+  assert.equal(thrown.ok, false);
+  assert.equal(thrown.source, 'cim', '失败来源必须标成 cim，便于诊断');
+  const healthy = listDescendantsDetailed(100, { platform: 'win32', cimImpl: cim });
+  assert.equal(healthy.ok, true, '正常查询必须标记可信');
 });

@@ -799,3 +799,55 @@ test('ProcessRegistry.sweepInjections：另一个还活着的 server 的注入�
     assert.equal(existsSync(path.join(dir, 'override.cfg')), true, '别人正在用的注入不能被还原');
   });
 });
+
+// ---------------------------------- stop 与 bridgeCleanup 的时序契约（不靠轮询）
+//
+// CI(Windows) 第一轮：stop 返回后注入没被清理。根因是 win32 分支只 await 了 terminateTree、
+// 没 await 'exit'，于是 depends-on-exit 的 bridgeCleanup 还没登记就被跳过。
+// 修法是 **在 ManagedProcess.stop 里 await exited**（两平台一致），而不是在注册表里轮询：
+//   · 'exit' 处理器是同步登记 bridgeCleanup 的；
+//   · 注册表的 exit 监听器先于 stop 的 once('exit') 注册，事件派发时先跑；
+//   · 因此 stop 返回时 bridgeCleanup 一定已就位，轮询纯属冗余，还会让「没有注入」的
+//     会话每次都白等（#cleanupProject 返回 undefined 时 bridgeCleanup 永远是 undefined）。
+
+test('ProcessRegistry.stop：exit 同步登记的 bridgeCleanup 会被如实返回', async () => {
+  const { ProcessRegistry } = await import('../src/processes.mjs');
+  const registry = new ProcessRegistry();
+  const fake = {
+    id: 'game-sync-cleanup',
+    kind: 'game',
+    running: true,
+    projectPath: '/tmp/sync-cleanup-proj',
+    stop: async () => {
+      // 真实时序：'exit' 处理器在 stop 解析前同步登记
+      fake.running = false;
+      fake.bridgeCleanup = Promise.resolve({ restored: true, removedScript: true });
+      return { stopped: true };
+    },
+  };
+  registry.processes.set(fake.id, fake);
+  const result = await registry.stop(fake.id);
+  assert.equal(result.stopped, true);
+  assert.ok(result.bridgeCleanup, `必须返回清理结果：${JSON.stringify(result)}`);
+  assert.equal(result.bridgeCleanup.restored, true);
+});
+
+test('ProcessRegistry.stop：没有注入的会话不会被额外等待拖慢（不做轮询）', async () => {
+  const { ProcessRegistry } = await import('../src/processes.mjs');
+  const registry = new ProcessRegistry();
+  const fake = {
+    id: 'game-no-injection',
+    kind: 'game',
+    running: true,
+    projectPath: '/tmp/no-injection-proj',
+    // 没有注入时 #cleanupProject 返回 undefined → bridgeCleanup 解析为 undefined
+    stop: async () => { fake.running = false; return { stopped: true }; },
+  };
+  registry.processes.set(fake.id, fake);
+  const started = Date.now();
+  const result = await registry.stop(fake.id);
+  const elapsed = Date.now() - started;
+  assert.equal(result.stopped, true);
+  assert.equal(result.bridgeCleanup, undefined);
+  assert.ok(elapsed < 500, `不得为没有注入的会话白等（实测 ${elapsed}ms）`);
+});

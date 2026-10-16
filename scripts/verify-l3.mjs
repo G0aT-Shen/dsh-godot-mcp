@@ -493,7 +493,7 @@ async function main() {
   record(
     'stop 后 override.cfg 与脚本目录都被清掉',
     zeroStop.bridgeCleanup?.removedOverride === true && zeroStop.bridgeCleanup?.removedScript === true,
-    JSON.stringify(zeroStop.bridgeCleanup),
+    zeroStop,
   );
   record(
     'stop 后项目目录恢复原状（只剩原有三个文件）',
@@ -512,14 +512,14 @@ async function main() {
   const exitDeadline = Date.now() + 10_000;
   while (exitingProcess.running && Date.now() < exitDeadline) await sleep(25);
   await exitingProcess.bridgeCleanup;
-  record('自然退出无需 stop 就清理运行时脚本', naturalQuit.ok && !exitingProcess.running && !existsSync(scriptPath));
+  record('自然退出无需 stop 就清理运行时脚本', naturalQuit.ok && !exitingProcess.running && !existsSync(scriptPath), {quit: naturalQuit, process: exitingProcess.toJSON(), cleanup: await exitingProcess.bridgeCleanup});
   record('自然退出后用户 override.cfg 逐字节还原', (await fsp.readFile(overridePath, 'utf8')) === ownOverride);
 
   const kindSession = await controller.session('game', { project: cleanDir, headless });
   if (!kindSession.ok) throw new Error(kindSession.error);
   await waitForPort(9091, 60_000);
   const kindStop = await controller.session('stop', { kind: 'game' });
-  record('按 kind 停止也等待注入清理', kindStop.ok && !existsSync(scriptPath) && !controller.processes.get(kindSession.session.id).running);
+  record('按 kind 停止也等待注入清理', kindStop.ok && !existsSync(scriptPath) && !controller.processes.get(kindSession.session.id).running, kindStop);
   record('重复启动并按 kind 停止后用户配置仍完整', (await fsp.readFile(overridePath, 'utf8')) === ownOverride);
 
   // ---------------------------------------------------------------- attach / detach

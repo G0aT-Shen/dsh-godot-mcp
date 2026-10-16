@@ -29,11 +29,34 @@
 import fs from 'node:fs';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { killTree, listDescendants } from './proc-tree.mjs';
+import { killTree, listDescendantsDetailed } from './proc-tree.mjs';
 
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024; // 单流上限，防止长跑游戏把磁盘写满
+// 终止/等待预算保持恒定值；诊断（diagPath）用于定位「父进程已死但迟迟没有结果」这类问题
+// 究竟卡在哪一步。
 const KILL_WAIT_MS = 10_000;
 const PARENT_POLL_MS = 1000;
+
+/**
+ * 事件诊断（JSON Lines，逐条追加）。
+ *
+ * 目的：Windows 上出现过「子/孙进程都已死、但 helper 迟迟没有落结果」的情况，
+ * 而现有信息不足以判断卡在哪一步。这里只记录**本任务自己的 pid 与分支决策**
+ * （父 pid、父存活判断、terminate 开始、taskkill 返回、close、结果落盘），
+ * 不枚举系统进程、不含任何命令行，避免把无关信息带出去。
+ *
+ * 任何诊断写入失败都不影响主流程（全部 try/catch 吞掉）。
+ */
+function createDiagnostics(diagPath, enabled = true) {
+  const startedAt = Date.now();
+  const write = event => {
+    if (!enabled || !diagPath) return;
+    try {
+      fs.appendFileSync(diagPath, `${JSON.stringify({ t: Date.now() - startedAt, event })}\n`);
+    } catch { /* 诊断不能影响主流程 */ }
+  };
+  return { write, startedAt };
+}
 
 function writeJsonAtomic(file, value) {
   const temporary = `${file}.tmp`;
@@ -90,11 +113,15 @@ async function runKillMode(requestPath) {
   const timeoutMs = Number(request.timeoutMs) > 0 ? Number(request.timeoutMs) : 8000;
   const startedAt = Date.now();
 
-  // **杀前快照**：父子关系一旦被破坏就再也枚举不出后代了
+  // **杀前快照**：父子关系一旦被破坏就再也枚举不出后代了。
+  // 快照来源与可信度如实记录：CIM 查询失败/空输出时不能把它当成「没有后代」。
   const targets = new Set();
+  const snapshotReports = [];
   for (const root of roots) {
     targets.add(root);
-    for (const descendant of listDescendants(root)) targets.add(descendant);
+    const info = listDescendantsDetailed(root);
+    for (const descendant of info.descendants) targets.add(descendant);
+    snapshotReports.push({ root, ok: info.ok, source: info.source, error: info.error, count: info.descendants.length });
   }
   const all = [...targets];
   const kills = [];
@@ -117,6 +144,8 @@ async function runKillMode(requestPath) {
     ok: survivors.length === 0,
     roots,
     snapshot: all.length,
+    snapshotOk: snapshotReports.every(report => report.ok),
+    snapshotReports,
     survivors,
     waitedMs: Date.now() - startedAt,
     kills: kills.map(kill => ({ method: kill.method, ok: kill.ok, descendants: kill.descendants })),
@@ -159,11 +188,16 @@ function main() {
     errPath,
     resultPath,
     statusPath,
+    diagPath,
     maxBytes = DEFAULT_MAX_BYTES,
   } = request;
 
   const startedAt = Date.now();
   const parentPid = process.ppid;
+  // 事件诊断：**显式 opt-in**（请求里给 diagPath 才写）。默认不新增任何文件，
+  // 保持「零足迹」语义 —— 生产路径上不会凭空多出 sidecar。
+  const diag = createDiagnostics(diagPath);
+  diag.write({ kind: 'start', helperPid: process.pid, parentPid, timeoutMs, exe });
   const counters = { stdout: 0, stderr: 0 };
   let truncated = false;
   const fds = {
@@ -223,9 +257,23 @@ function main() {
       args,
       ...extra,
     };
+    diag.write({
+      kind: 'finish',
+      durationMs,
+      timedOut,
+      orphaned,
+      killed: Boolean(killResult),
+      closed,
+      stillRunning: Boolean(extra?.stillRunning),
+      childPid: child?.pid,
+      reason: extra?.killReason,
+    });
+    const writeStarted = Date.now();
     try {
       writeJsonAtomic(resultPath, result);
+      diag.write({ kind: 'result-written', writeMs: Date.now() - writeStarted });
     } catch (error) {
+      diag.write({ kind: 'result-write-error', writeMs: Date.now() - writeStarted, error: String(error?.message ?? error) });
       process.stderr.write(`cannot write result: ${error?.message ?? error}\n`);
       process.exitCode = 3;
       return;
@@ -243,6 +291,7 @@ function main() {
   const killAndWait = async (reason, extra = {}) => {
     if (terminating) return;
     terminating = true;
+    diag.write({ kind: 'terminate-start', reason, childPid: child?.pid, alreadyClosed: closed });
     clearTimeout(timer);
     let killError;
     try {
@@ -250,11 +299,23 @@ function main() {
         finish({ ...extra, spawnError: true });
         return;
       }
+      const killStarted = Date.now();
       killResult = await killTree(child.pid, { force: true });
+      diag.write({
+        kind: 'killtree-done',
+        elapsedMs: Date.now() - killStarted,
+        ok: killResult?.ok,
+        method: killResult?.method,
+        code: killResult?.code,
+        descendants: killResult?.descendants,
+        error: killResult?.error,
+        stderrTail: typeof killResult?.stderr === 'string' ? killResult.stderr.slice(0, 200) : undefined,
+      });
       const deadline = Date.now() + KILL_WAIT_MS;
       while (Date.now() < deadline && !closed) {
         await new Promise(resolve => setTimeout(resolve, 25));
       }
+      diag.write({ kind: 'close-wait-done', closed, waitedMs: KILL_WAIT_MS - Math.max(0, deadline - Date.now()) });
       const stillRunning = !closed;
       // 再确认一次：close 没到但进程其实已经没了（Windows 上 pid 复用/句柄延迟）
       if (stillRunning && !isAlive(child.pid)) closed = true;
@@ -291,6 +352,7 @@ function main() {
   timer = timeoutMs > 0
     ? setTimeout(() => {
         timedOut = true;
+        diag.write({ kind: 'timeout-fired', timeoutMs });
         killAndWait('timeout').catch(error => {
           finish({ timedOut: true, killError: String(error?.message ?? error) });
         });
@@ -302,9 +364,15 @@ function main() {
   parentWatch = setInterval(() => {
     if (settled) return;
     const current = process.ppid;
-    if (current !== parentPid || (parentPid > 0 && !isAlive(parentPid))) {
+    const parentAlive = parentPid > 0 ? isAlive(parentPid) : false;
+    const ppidChanged = current !== parentPid;
+    // 每个 poll 都留痕：这样 Windows 上「到底有没有触发 parent-gone」有据可查
+    diag.write({ kind: 'watch-poll', parentPid, currentPpid: current, parentAlive, ppidChanged, closed });
+    if (ppidChanged || !parentAlive) {
       orphaned = true;
+      diag.write({ kind: 'parent-gone', branch: ppidChanged ? 'ppid-changed' : 'parent-not-alive' });
       killAndWait('parent-gone').catch(error => {
+        diag.write({ kind: 'kill-and-wait-error', error: String(error?.message ?? error) });
         finish({ orphaned: true, killError: String(error?.message ?? error) });
       });
     }
@@ -322,6 +390,7 @@ function main() {
     // 由 killAndWait 统一落结果，避免「杀树没做完就 exit」。
     closed = true;
     exitInfo = { exitCode: code, signal: signal ?? null };
+    diag.write({ kind: 'close', exitCode: code, signal: signal ?? null, childPid: child?.pid });
     if (terminating) return;
     finish({ ...exitInfo, durationMs: Date.now() - startedAt });
   });

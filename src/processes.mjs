@@ -163,7 +163,27 @@ class ManagedProcess extends EventEmitter {
     if (process.platform === 'win32' && pid !== undefined) {
       // 关键：必须在根进程还活着时按 pid 枚举后代。/T 不带 /F 是「尽力优雅」，
       // headless 控制台进程通常拒绝优雅退出，此时如实记录原因再 /T /F。
+      // 有界等待的计时器**必须清掉**：Promise.race 输掉的那条 5s/3s timer 会拖住事件循环
+      // （之前 runProcess 里踩过同样的坑）。
+      const raceExited = async ms => {
+        let timer;
+        try {
+          return await Promise.race([exited, new Promise(resolve => { timer = setTimeout(resolve, ms); })]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
       tree = await terminateTree(pid, { graceMs, isAlive: () => this.running });
+      // terminateTree 只保证「按 pid 快照的进程都消失了」；Node 的 'exit' 事件
+      // （由它负责登记 bridgeCleanup）可能还没派发。旧实现这里直接返回，于是调用方
+      // await bridgeCleanup 时拿到 undefined，**整段注入清理被跳过** ——
+      // CI 实测：Windows 上 stop 返回后 override.cfg 仍是注入态。
+      await raceExited(5000);
+      if (this.running) {
+        // 还没退出：按已知 pid 再补一轮强杀（有界），仍不退出就如实上报
+        try { await terminateTree(pid, { graceMs: 0, isAlive: () => this.running }); } catch { /* 已退出 */ }
+        await raceExited(3000);
+      }
     } else {
       const signalGroup = name => {
         if (pid === undefined) return;
@@ -288,6 +308,8 @@ export class ProcessRegistry {
     if (!this.transientBridges.has(projectPath) && !untracked) return undefined;
     if (this.#projectActive(projectPath)) return { deferred: true, reason: 'project-in-use' };
     const result = await restoreTransientBridge(projectPath);
+    // 注意：restoreTransientBridge 失败时**会抛出**（带 step/code），因此不会走到这里；
+    // 状态条目与备份都保留，后续 cleanup 仍能重试。
     this.transientBridges.delete(projectPath);
     return result;
   }
@@ -492,6 +514,13 @@ export class ProcessRegistry {
       return undefined;
     }
     const result = await process_.stop(options);
+    // 不做轮询等待：
+    //   · 'exit' 处理器是**同步**登记 `bridgeCleanup` 的（见 #spawn 里的 on('exit')）；
+    //   · ManagedProcess.stop 在 win32 与 POSIX 两条分支上都已经 await 过 exited，
+    //     而注册表那个 exit 监听器先于 stop 的 once('exit') 注册 —— 事件派发时它先跑，
+    //     所以 stop 返回时 bridgeCleanup 早已就位。
+    // 反过来，加轮询会掩盖真实的时序问题：对「没有注入」的会话
+    // （#cleanupProject 返回 undefined）会白白等满 3 秒。
     const cleanup = await process_.bridgeCleanup;
     return cleanup ? { ...result, bridgeCleanup: cleanup } : result;
   }

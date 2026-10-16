@@ -47,6 +47,7 @@ var _params: Dictionary = {}
 var _root := ""            # absolute project dir as Godot resolved --path (normalized)
 var _script_file := ""      # this script path (from --script); used to locate the Node helper
 var _rng_seeded := false    # 临时产物名里的随机后缀只需要 seed 一次
+var _verdict_script: GDScript = null   # check_verdict.gd（惰性加载）
 var _failed := false
 var _done := false         # quit() only raises a flag: handlers must not run on
 
@@ -586,6 +587,15 @@ func _ops_script_dir() -> String:
 	if _script_file.is_empty():
 		return ""
 	return _script_file.get_base_dir()
+
+## 判定「嵌套 --check-only 是否可信地跑完」的逻辑单独放在同目录的 check_verdict.gd：
+## 它既被这里调用，也能用 `godot --headless --script check_verdict.gd` 跑判定表自测。
+func verdict_script() -> GDScript:
+	if _verdict_script == null and not _script_file.is_empty():
+		var candidate := _script_file.get_base_dir().path_join("check_verdict.gd")
+		if FileAccess.file_exists(candidate):
+			_verdict_script = load(candidate)
+	return _verdict_script
 
 func resolve_helper_script() -> String:
 	var explicit := OS.get_environment(HELPER_PATH_ENV).strip_edges()
@@ -2207,30 +2217,44 @@ func _op_parse_check() -> void:
 			finish_error(spawn_error_message(run, "deep parse_check 的逐文件 --check-only"))
 			return
 		var combined := str(run["stderr"]) + "\n" + str(run["stdout"])
-		# 只有「真正跑完且正常退出」的那次检查，其 stderr 才能当作语法结论。
-		# 超时（137）、异常退出、孤儿/残留进程都意味着这个文件的检查**没完成** ——
-		# 这时把 errors 留空就是在谎报「干净」。显式记成 check_failed 并计数。
-		var trust = int(run["exit_code"]) == 0 \
-			and not bool(run.get("timed_out", false)) \
-			and not bool(run.get("orphaned", false)) \
-			and not bool(run.get("still_running", false))
-		if not trust:
+		# 「这次检查是否可信地跑完了」的判定：**单一来源**在 check_verdict.gd
+		# （规则：timeout/orphan/still_running/杀树失败 → 不可信；exit 0 → 可信；
+		#  exit 1 且解析出带定位的诊断 → 可信（Windows 的 --check-only 解析失败就是 1）；
+		#  其它非零（137、崩溃码…）→ 不可信，即便日志里残留 Parse Error 文本）。
+		var exit_code := int(run["exit_code"])
+		var parsed_errors: Array = _parse_godot_errors(combined, str(path))
+		var has_located_diagnostic := false
+		for err in parsed_errors:
+			if int(err.get("line", 0)) > 0 and _looks_like_script_path(str(err.get("origin", ""))):
+				has_located_diagnostic = true
+				break
+		var verdict_script := verdict_script()
+		if verdict_script == null:
+			finish_error("缺少 check_verdict.gd（应与 ops.gd 同目录发布）：" + _script_file.get_base_dir())
+			return
+		var verdict: Dictionary = verdict_script.check_completed(run, has_located_diagnostic)
+		if not bool(verdict["completed"]):
 			var fail_key := "failed|" + str(path)
 			groups[fail_key] = {
 				"path": str(path), "origin": str(path), "line": 0,
-				"message": "check did not complete: exit=%d timed_out=%s orphaned=%s still_running=%s" % [
-					int(run["exit_code"]), str(bool(run.get("timed_out", false))),
-					str(bool(run.get("orphaned", false))), str(bool(run.get("still_running", false))),
-				],
+				"message": (
+					"check did not complete: exit=%d timed_out=%s orphaned=%s still_running=%s kill_failed=%s" % [
+						exit_code, str(bool(run.get("timed_out", false))),
+						str(bool(run.get("orphaned", false))), str(bool(run.get("still_running", false))),
+						str(bool(verdict["kill_failed"])),
+					] if bool(verdict["incomplete"]) else
+					"check exited %d without a valid located diagnostic (unexplained nonzero exit)" % exit_code
+				),
 				"cascade": false, "affects": [str(path)], "check_failed": true,
 				"stderr_tail": _tail(combined, 800),
 			}
 			order.append(fail_key)
 			checks_failed += 1
 			continue
-		if not _looks_like_engine_error(combined):
-			continue  # in-process probe was a false positive (e.g. unresolved preload)
-		for err in _parse_godot_errors(combined, str(path)):
+		var has_diagnostic := _looks_like_engine_error(combined)
+		if not has_diagnostic:
+			continue  # exit 0 且没有引擎诊断：初筛假阳性（例如 unresolved preload）
+		for err in parsed_errors:
 			var key := "%s|%d|%s" % [str(err["origin"]), int(err["line"]), str(err["message"])]
 			if groups.has(key):
 				groups[key]["affects"].append(str(path))

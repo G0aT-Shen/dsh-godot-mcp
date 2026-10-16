@@ -46,6 +46,26 @@ function stateFile() {
   return path.join(stateDir(), 'transient.json');
 }
 
+/**
+ * 给清理步骤加诊断上下文（step + code），行为不变：失败照样抛出。
+ *
+ * 抛出（而不是吞掉/返回）是刻意的：`restoreTransientBridge` 抛出时不会执行
+ * `forgetProject`，状态条目因此保留、后续 `cleanup` 仍能重试；
+ * 备份也绝不会被误删（复制失败会在删备份之前抛出）。
+ */
+async function cleanupStep(step, action) {
+  try {
+    return await action();
+  } catch (error) {
+    const code = error?.code ?? 'CLEANUP_STEP_FAILED';
+    const wrapped = new Error(`cleanup step '${step}' failed: ${String(error?.message ?? error)} (code=${code})`);
+    wrapped.code = code;
+    wrapped.step = step;
+    wrapped.cause = error;
+    throw wrapped;
+  }
+}
+
 export class InjectionError extends Error {
   constructor(message, code = 'INJECTION_FAILED') {
     super(message);
@@ -178,7 +198,9 @@ export async function injectTransientBridge(projectPath, options = {}) {
     await fsp.copyFile(state.overridePath, state.backupPath);
   }
   if (state.scriptExists) {
-    await fsp.rm(path.join(projectPath, TRANSIENT_DIR_RELATIVE), { recursive: true, force: true });
+    // 删不掉就抛出（保持原行为：绝不无视旧目录继续覆盖）
+    await cleanupStep('remove-stale-script-dir', () =>
+      fsp.rm(path.join(projectPath, TRANSIENT_DIR_RELATIVE), { recursive: true, force: true }));
     recovered.removedStaleScript = true;
   }
 
@@ -230,17 +252,19 @@ export async function restoreTransientBridge(projectPath) {
   const result = { restored: false, removedOverride: false, removedScript: false };
 
   if (state.backupExists) {
-    await fsp.copyFile(state.backupPath, state.overridePath);
-    await fsp.rm(state.backupPath, { force: true });
+    // 顺序即安全边界：复制失败会在删备份**之前**抛出，用户唯一备份因此不会丢
+    await cleanupStep('restore-override', () => fsp.copyFile(state.backupPath, state.overridePath));
+    await cleanupStep('remove-backup', () => fsp.rm(state.backupPath, { force: true }));
     result.restored = true;
   } else if (state.overrideHasAutoload) {
     // 没有备份 = override.cfg 本来不存在，整份删掉
-    await fsp.rm(state.overridePath, { force: true });
+    await cleanupStep('remove-override', () => fsp.rm(state.overridePath, { force: true }));
     result.removedOverride = true;
   }
 
   if (state.scriptExists) {
-    await fsp.rm(path.join(projectPath, TRANSIENT_DIR_RELATIVE), { recursive: true, force: true });
+    await cleanupStep('remove-script-dir', () =>
+      fsp.rm(path.join(projectPath, TRANSIENT_DIR_RELATIVE), { recursive: true, force: true }));
     result.removedScript = true;
   }
 

@@ -46,28 +46,33 @@ export function taskkillArgs(pid, { force = true, tree = true } = {}) {
  * @param {{psImpl?: () => string}} [options]
  * @returns {number[]} 后代 pid，深到浅（先杀子孙，再杀子）
  */
-export function listDescendants(pid, options = {}) {
-  const { psImpl } = options;
-  let output;
-  try {
-    output = psImpl
-      ? psImpl()
-      : spawnSync('ps', ['-A', '-o', 'pid=,ppid='], { encoding: 'utf8', timeout: 10_000 }).stdout ?? '';
-  } catch {
-    return [];
-  }
-  const childrenOf = new Map();
-  for (const line of String(output).split('\n')) {
+/** 解析 `ps -A -o pid=,ppid=` 形态的输出（空行/坏行忽略）。 */
+function parsePsPairs(text) {
+  const pairs = [];
+  for (const line of String(text ?? '').split('\n')) {
     const [child, parent] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(child) || !Number.isInteger(parent)) continue;
+    pairs.push([child, parent]);
+  }
+  return pairs;
+}
+
+/** 从 (pid, ppid) 对构建某 pid 的子树（后序：深的在前；visited 防成环）。 */
+function buildTree(pairs, pid) {
+  const childrenOf = new Map();
+  for (const [child, parent] of pairs) {
     if (!Number.isInteger(child) || !Number.isInteger(parent)) continue;
     if (!childrenOf.has(parent)) childrenOf.set(parent, []);
     childrenOf.get(parent).push(child);
   }
   const ordered = [];
+  const visited = new Set([pid]);
   const walk = current => {
     for (const child of childrenOf.get(current) ?? []) {
+      if (visited.has(child)) continue;
+      visited.add(child);
       walk(child);
-      ordered.push(child); // 后序：深的先进列表
+      ordered.push(child);
     }
   };
   walk(pid);
@@ -75,11 +80,133 @@ export function listDescendants(pid, options = {}) {
 }
 
 /**
+ * 用真实 CIM 查询拿 Windows 的 (pid, ppid) 对：只取 `ProcessId/ParentProcessId`，不取命令行。
+ * 失败（执行错误/非零退出/空输出/0 行/JSON 坏）一律 `ok:false` —— 不静默、不编造。
+ */
+function windowsProcessPairs(cimImpl, timeoutMs) {
+  const started = Date.now();
+  const fail = error => ({ pairs: [], ok: false, error, elapsedMs: Date.now() - started });
+  let text;
+  if (cimImpl) {
+    try {
+      text = String(cimImpl() ?? '');
+    } catch (error) {
+      return fail(`CIM 注入实现抛错：${String(error?.message ?? error)}`);
+    }
+  } else {
+    // 注意：spawnSync **不会**因为命令失败而抛错，必须显式检查 error/status。
+    const result = spawnSync('powershell', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress',
+    ], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
+    if (result?.error) return fail(`PowerShell 执行失败：${String(result.error.message ?? result.error)}`);
+    if (typeof result?.status === 'number' && result.status !== 0) return fail(`PowerShell 退出码 ${result.status}`);
+    text = String(result?.stdout ?? '');
+  }
+  if (!text.trim()) return fail('CIM 查询返回空输出（PowerShell 不可用或被拦截）');
+  let rows;
+  try {
+    const parsed = JSON.parse(text);
+    rows = Array.isArray(parsed) ? parsed : [parsed];
+  } catch (error) {
+    return fail(`CIM 输出不是合法 JSON：${String(error?.message ?? error)}`);
+  }
+  if (rows.length === 0) return fail('CIM 查询返回 0 个进程（不可信）');
+  return {
+    pairs: rows.map(row => [Number(row?.ProcessId), Number(row?.ParentProcessId)]),
+    ok: true,
+    elapsedMs: Date.now() - started,
+  };
+}
+
+/**
+ * 列出某个 pid 的全部后代（不含它自己）＋**快照是否可信**。
+ *
+ * Windows 的 CIM 查询是同步阻塞的，会计入整个取消/超时预算，所以支持 timeoutMs，
+ * 并在失败时返回 ok:false（调用方据此如实上报「快照不完整」，不能当成空树然后宣称已回收干净）。
+ *
+ * @param {number} pid
+ * @param {{psImpl?: () => string, cimImpl?: () => string, platform?: NodeJS.Platform,
+ *          timeoutMs?: number}} [options]
+ * @returns {{descendants: number[], ok: boolean, source: 'ps'|'cim'|'injected-ps'|'none',
+ *            error?: string, elapsedMs: number, total?: number}}
+ */
+export function listDescendantsDetailed(pid, options = {}) {
+  const { psImpl, cimImpl, platform = process.platform, timeoutMs = 10_000 } = options;
+  let pairs = [];
+  let source = 'none';
+  let ok = true;
+  let error;
+  let elapsedMs = 0;
+
+  // 平台优先：Windows 没有 ps，必须走 CIM。
+  if (platform === 'win32') {
+    source = 'cim';
+    const result = windowsProcessPairs(cimImpl, timeoutMs);
+    pairs = result.pairs;
+    ok = result.ok;
+    error = result.error;
+    elapsedMs = result.elapsedMs;
+  } else if (psImpl) {
+    source = 'injected-ps';
+    const started = Date.now();
+    try {
+      const text = String(psImpl() ?? '');
+      if (!text.trim()) {
+        ok = false;
+        error = 'ps 注入实现返回空输出（不可信）';
+      } else {
+        pairs = parsePsPairs(text);
+      }
+    } catch (caught) {
+      ok = false;
+      error = `ps 注入实现抛错：${String(caught?.message ?? caught)}`;
+    }
+    elapsedMs = Date.now() - started;
+  } else {
+    source = 'ps';
+    const started = Date.now();
+    const result = spawnSync('ps', ['-A', '-o', 'pid=,ppid='], { encoding: 'utf8', timeout: timeoutMs });
+    elapsedMs = Date.now() - started;
+    if (result?.error) {
+      ok = false;
+      error = `ps 执行失败：${String(result.error.message ?? result.error)}`;
+    } else if (typeof result?.status === 'number' && result.status !== 0) {
+      ok = false;
+      error = `ps 退出码 ${result.status}`;
+    } else {
+      const text = String(result?.stdout ?? '');
+      if (!text.trim()) {
+        ok = false;
+        error = 'ps 返回空输出（不可信）';
+      } else {
+        pairs = parsePsPairs(text);
+      }
+    }
+  }
+
+  return {
+    descendants: buildTree(pairs, pid),
+    ok,
+    source,
+    ...(error ? { error } : {}),
+    elapsedMs,
+    total: pairs.length,
+  };
+}
+
+/** 只取后代的便捷形态（保留旧签名）。 */
+export function listDescendants(pid, options = {}) {
+  return listDescendantsDetailed(pid, options).descendants;
+}
+
+/**
  * 结束一棵进程树。
  *
  * @param {number} pid 根进程 pid（**必须仍然存活**，否则 Windows 上无法定位后代）
  * @param {{force?: boolean, platform?: NodeJS.Platform, env?: Record<string,string|undefined>,
- *          timeoutMs?: number, spawnImpl?: typeof spawn, psImpl?: () => string}} [options]
+ *          timeoutMs?: number, spawnImpl?: typeof spawn, psImpl?: () => string,
+ *          cimImpl?: () => string}} [options]
  * @returns {Promise<{ok: boolean, method: 'process-group'|'process'|'taskkill', force: boolean,
  *          code?: number|null, stderr?: string, error?: string}>}
  */
@@ -91,6 +218,7 @@ export function killTree(pid, options = {}) {
     timeoutMs = 15_000,
     spawnImpl = spawn,
     psImpl,
+    cimImpl,
   } = options;
 
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -103,7 +231,7 @@ export function killTree(pid, options = {}) {
     // 之后再也枚举不出后代。真实 Godot 的 OS.create_process 会给子进程**新建进程组**
     // （helper 是组长，嵌套 Godot 又是另一个组长），所以「按组杀外层」覆盖不到它们 ——
     // 逐个后代 kill 才是主路径，组杀只是快路径。
-    const descendants = listDescendants(pid, { psImpl });
+    const descendants = listDescendants(pid, { psImpl, cimImpl, platform });
     let groupOk = false;
     try {
       process.kill(-pid, signal); // pid 自己是组长时一次覆盖整组

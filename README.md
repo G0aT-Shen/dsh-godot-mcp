@@ -98,7 +98,7 @@ GitHub 上已有 30+ 个 Godot MCP 项目，但都不适合直接用在 DSH 里�
 强杀 server 后的残留仍需 cleanup 回收。此保护范围是单个 server，多个独立 server 请使用不同项目副本。
 
 stdio MCP 会及时处理 ping、工具发现、自检和 `notifications/cancelled`，其他工具调用保持串行。
-取消排队中的请求会阻止它执行；取消 L1 操作会终止它的进程组；连接断开或 stdin EOF 也会取消待执行和正在执行的请求。
+取消排队中的请求会阻止它执行；取消 L1 操作会回收它的进程树；连接断开或 stdin EOF 也会取消待执行和正在执行的请求。
 取消 L2/L3 桥调用会立即关闭连接、停止等待，**已经在 Godot 内开始的操作不会回滚，也不保证停止**；
 脚本协程仍受引擎侧超时和看门狗约束。取消会话启动时，如果进程或 attach 已创建，会先停止并清理它。
 
@@ -275,7 +275,7 @@ node scripts/verify-export.mjs    # release 导出 + 门控（成品 9091 不监
 | 截图是唯一能看游戏状态的手段，贵且看不出数值差异 | 没有结构化观测 | 新增 `rt.freeze` / `rt.step` / `rt.digest`：冻结时钟后按帧精确推进，状态直接出 JSON |
 | 改完脚本「有没有炸」只能靠人去翻游戏 stdout | 没有运行时错误通道 | 新增 `rt.errors`：走 `OS.add_logger(Logger)`，捕获脚本运行时错误 / `push_error` / `push_warning`，**带真实 backtrace**；`rt.step` 还会顺带回报本次推进窗口内新增的错误数 |
 | 一次只能注入一个输入，且不知道打中了谁 | 只有单发 `rt.input` | 新增 `rt.act`：一串操作一次跑完，**逐步回报**命中的 Control 与被观察节点的状态变化；配套 `rt.ui` 列出可见控件 |
-| DSH 里的工具行为跟仓库对不上，看不出哪边是旧的 | 长驻 server 进程把 ESM 模块缓存在内存里，改完源码不重启就不生效，**且没有任何字段暴露这一点** | `godot_status` 返回 `server.pid` + `build.loaded/onDisk/stale`，`stale` 时直接给出 `kill -TERM <pid>`（mcp-client 会自动拉起）；`initialize` 里也带 `serverInfo.build` |
+| DSH 里的工具行为跟仓库对不上，看不出哪边是旧的 | 长驻 server 进程把 ESM 模块缓存在内存里，改完源码不重启就不生效，**且没有任何字段暴露这一点** | `godot_status` 返回 `server.pid` + `build.loaded/onDisk/stale`，`stale` 时给出 Windows 重启 DSH 或 POSIX 精确终止 MCP 进程的提示；`initialize` 里也带 `serverInfo.build` |
 | 沙箱/只读 HOME 下 `parse_check` 报「没有错误」，其实是**一个文件都没检查** | 嵌套进程的助手脚本只写 `user://mcp_tmp`，写不进去就静默跳过每个文件 | 助手脚本目录 `user://` → 系统临时目录自动回退；可用 `GODOT_MCP_HELPER_DIR` 显式指定；五个嵌套调用点（run_project / gdscript / import_assets / export_project / deep parse_check）在跑不起来时**一律报错**并给出原因与修法 |
 
 ## 目录结构

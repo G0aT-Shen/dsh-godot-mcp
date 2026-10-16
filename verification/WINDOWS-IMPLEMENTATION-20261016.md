@@ -20,13 +20,20 @@ DSH 原任务在充值前因供应商 HTTP 402 中断；充值后沿用原 job/s
 | 平台 / 检查 | 结果 |
 |---|---|
 | macOS 原生 release 导出与门控 | `node scripts/verify-export.mjs`：10/10，退出码 0；成品连续运行 10 秒默认未监听，显式 opt-in 后 `rt.eval` 返回 42，清理后端口关闭 |
-| 完整单元、配置与真实进程生命周期 | 最终构建 `4f6074a57ba4`：`npm test` 139/139，失败 0、跳过 0、退出码 0 |
+| 完整单元、配置与真实进程生命周期 | 修复后构建 `5d5ee6f7fb7c`：`npm test` 145/145，失败 0、跳过 0、退出码 0 |
 | DSH profile / MCP / L1 / L3 | 隔离安装两次字节幂等；wiring 15/15、MCP 17/17、操作 19/19、诊断 29/29、L3 63/63，全部退出码 0 |
-| 本机桌面 DSH 最终冒烟 | 同一 job/session 第 4 轮；构建 `4f6074a57ba4`、`stale:false`，五工具真实调用、自定义端口 19091、`rt.eval=42`；stop 后端口关闭、无运行中游戏、override SHA256 前后相同 |
-| GitHub Windows Node 20 / 24 | 待推送后实际运行，不能把 workflow 已创建当成通过 |
+| 本机桌面 DSH 首批冒烟（第三轮 CI 修复前） | 同一 job/session 第 4 轮；构建 `4f6074a57ba4`、`stale:false`，五工具真实调用、自定义端口 19091、`rt.eval=42`；stop 后端口关闭、无运行中游戏、override SHA256 前后相同 |
+| GitHub Windows Node 20 / 24 | 前两轮实际失败，第三轮修复待运行；安装/wiring/MCP/基础操作/导出已在两套 Node 中通过，生命周期与诊断未通过 |
 | Windows 桌面 DSH 交互 | 未验收：当前没有 Windows 桌面宿主 |
 
 独立执行日志：`/tmp/godot-mcp-primary-verification-20261016/`（本次验收宿主）；上述命令均直接记录退出码，未通过管道掩盖失败。macOS 导出检查也在最终构建上重新执行，10/10、退出码 0。
+
+## Windows 实际运行与修复
+
+- [首轮](https://github.com/G0aT-Shen/dsh-godot-mcp/actions/runs/38867867492)：官方引擎解包、版本运行、隔离 profile 和 wiring 全通过；Windows 生命周期断言失败。
+- [第二轮](https://github.com/G0aT-Shen/dsh-godot-mcp/actions/runs/38869052381)：独立下游检查继续执行，MCP 17/17、操作 19/19、Windows release 导出 10/10；诊断 19/24、L3 59/63，仍失败。Windows 的 helper 只读目录权限测试未执行（平台布局不同），没有算成通过。
+- 修复 Windows 杀树后等待 Node close/exit 的竞态；增加原生 CIM 后代快照；仅在退出码 1 且真实解析出带定位诊断时接受语法检查结果，137/超时/孤儿/残留或杀树失败仍记 incomplete。新增 `godot/check_verdict.gd` 需与 `ops.gd` 一起分发。
+- 父进程强杀后的 helper 落结果异常暂未定位；加入仅测试显式开启的事件诊断，不用缩短预算掩盖失败。第三轮会验证。
 
 ## 使用边界与迁移验收
 
