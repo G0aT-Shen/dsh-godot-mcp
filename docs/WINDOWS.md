@@ -6,9 +6,8 @@
 
 - 首个支持目标：**Windows 11 x64 + 桌面 DSH**。
 - Windows ARM64 / Windows 10 **未验证**，不宣称支持。
-- 本轮交付在 macOS 上完成实现与回归；**Windows 实机验收尚未进行**（见文末「验收状态」）。
-  `npm test`、MCP 协议、L1 操作、运行时桥、导出等套件已按原生 Windows 路径改造，
-  并由 CI（`.github/workflows/windows.yml`，`windows-latest` × Node 20/24）真实执行。
+- 原生 Windows CI 已通过：Windows Server 2025 x64 × Node 20/24，覆盖安装、MCP 协议、L1、运行时清理和原生导出；**Windows 11 桌面 DSH 的交互验收尚未进行**（见文末「验收状态」）。
+- 已验收代码提交：`feaaca6fc4a691c44138ef291aa0b6a550e8cb60`；Node 运行时构建 `5d5ee6f7fb7c`。后续纯文档提交不改变此构建。
 
 ---
 
@@ -167,13 +166,16 @@ if ($pkgBackup) {
 
 ---
 
-## 7. 验收状态（不要把它读成「已在 Windows 上跑通」）
+## 7. 验收状态
 
 | 项目 | 状态 |
 |---|---|
-| 源码适配（无 POSIX shell 依赖、Windows 定位/杀树/端口/路径） | **已实现**，macOS 上真实回归 |
-| `.github/workflows/windows.yml`（Node 20/24、官方引擎与模板、隔离 profile） | 由主审推送后**真实执行**，本机不冒称已绿 |
-| Windows 实机 DSH 五工具 + 交互式场景 | **待验收**（本轮无 Windows 宿主） |
+| 源码适配（无 POSIX shell 依赖、Windows 定位/杀树/端口/路径） | **已实现并在原生 Windows CI 验证** |
+| `.github/workflows/windows.yml`（Node 20/24、官方引擎与模板、隔离 profile） | [第四轮全部通过](https://github.com/G0aT-Shen/dsh-godot-mcp/actions/runs/38872012852)；每组单元 145/145、wiring 15/15、MCP 17/17、操作 19/19、诊断 24/24、运行时 63/63、导出 10/10 |
+| 本机 macOS 桌面 DSH 五工具 | 最终构建真实调用通过，`stale:false`、`rt.eval=42`、配置原样恢复且端口关闭 |
+| Windows 11 桌面 DSH 五工具 + 交互式场景 | **待验收**（本轮无交互式 Windows 宿主） |
+
+完整结果、已修复问题及平台边界见 [实施与验收报告](../verification/WINDOWS-IMPLEMENTATION-20261016.md)。Windows CI 的通过不覆盖桌面 DSH 客户端重连、真实窗口、截图/输入、锁屏唤醒；诊断套件也未以 macOS 权限探针代替 Windows ACL 验证。
 
 实机验收最低清单：五个工具真实可用、`stale: false`、L1 建项目/导入/深检查/运行/导出、
 L2 编辑器读写与 UndoRedo、L3 属性/方法/输入/截图、取消与超时无残留后代、
